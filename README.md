@@ -25,7 +25,10 @@ ingests.
 
 ## Compatibility
 
-- Android 7.0 (API 24) and up
+- Android 8.0 (API 26) and up — `java.time` is the session-clock and
+  log-writer backbone, and on API 24/25 it requires core-library
+  desugaring at every consumer site, which isn't worth the friction
+  for the tiny Android 7 share remaining in 2026
 - Kotlin 2.1 / Coroutines 1.9 / AGP 8.12
 - Wire-format compatible with `syncfield-swift` v0.3 — `manifest.json`,
   `sync_point.json`, `<streamId>.jsonl`, and `<streamId>.timestamps.jsonl`
