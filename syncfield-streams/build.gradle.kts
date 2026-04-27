@@ -39,6 +39,8 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
+    api(libs.androidx.lifecycle.process)
+    api(libs.androidx.lifecycle.runtime.ktx)
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)

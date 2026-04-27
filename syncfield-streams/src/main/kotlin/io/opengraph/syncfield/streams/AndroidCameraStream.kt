@@ -21,6 +21,7 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import io.opengraph.syncfield.HealthBus
 import io.opengraph.syncfield.HealthEvent
 import io.opengraph.syncfield.SessionClock
@@ -64,9 +65,17 @@ import kotlin.coroutines.resumeWithException
  *   through [setFrameProcessor]; it reuses the analyser hooks so a
  *   single CameraX pipeline serves both telemetry and analysis.
  */
-class AndroidCameraStream(
+class AndroidCameraStream @JvmOverloads constructor(
     private val context: Context,
-    private val lifecycleOwner: LifecycleOwner,
+    /**
+     * Lifecycle that gates the underlying CameraX use cases. Defaults
+     * to [ProcessLifecycleOwner] so callers (the RN bridge module in
+     * particular) don't need to plumb an Activity reference through —
+     * the camera stays bound for the whole foreground lifetime of the
+     * app, which matches how `iPhoneCameraStream`'s `AVCaptureSession`
+     * behaves on iOS.
+     */
+    private val lifecycleOwner: LifecycleOwner = ProcessLifecycleOwner.get(),
     override val streamId: String = "cam_ego",
     private val videoSettings: VideoSettings = VideoSettings.HD720_60,
     private val cameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA,
