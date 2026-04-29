@@ -38,15 +38,7 @@ dependencies {
     api(project(":syncfield-core"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
-
-    // Insta360's Android SDK (`OneSDK`) is distributed as an AAR. Host apps
-    // drop `OneSDK.aar` into their `libs/` directory and add a `flatDir`
-    // repository plus a flatfile dependency:
-    //   implementation(name = "OneSDK", ext = "aar")
-    // This module declares its compile-time integration through the
-    // `OneSDKBridge` indirection in `Insta360OneSDKBridge.kt` so the
-    // module compiles cleanly without the AAR present (host apps that
-    // don't need Insta360 don't pay the cost).
+    implementation(libs.insta.camera)
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)

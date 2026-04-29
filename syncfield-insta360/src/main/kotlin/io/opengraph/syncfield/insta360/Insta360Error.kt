@@ -3,10 +3,10 @@ package io.opengraph.syncfield.insta360
 sealed class Insta360Error(message: String) : Exception(message) {
 
     object FrameworkNotLinked :
-        Insta360Error("Insta360Error: INSCameraSDK Android AAR is not on the classpath")
+        Insta360Error("Insta360Error: Insta360 Android SDK is not on the classpath")
 
     object NotPaired :
-        Insta360Error("Insta360Error: camera is not paired — call connect() first")
+        Insta360Error("Insta360Error: camera is not paired - call connect() first")
 
     object NotConnected :
         Insta360Error("Insta360Error: SyncField session is not connected")
@@ -22,6 +22,18 @@ sealed class Insta360Error(message: String) : Exception(message) {
 
     class CommandFailed(detail: String) :
         Insta360Error("Insta360Error: BLE command failed ($detail)")
+
+    object ScanAlreadyActive :
+        Insta360Error("Insta360Error: BLE scan is already active")
+
+    class DeviceNotDiscovered(uuid: String) :
+        Insta360Error("Insta360Error: camera '$uuid' is not in the current scan set")
+
+    class DeviceNotPaired(uuid: String) :
+        Insta360Error("Insta360Error: camera '$uuid' is not paired")
+
+    class IdentifyPhotoFailed(detail: String) :
+        Insta360Error("Insta360Error: identify photo failed ($detail)")
 
     object CameraNotReachable :
         Insta360Error("Insta360Error: camera AP reachable timeout at 192.168.42.1")

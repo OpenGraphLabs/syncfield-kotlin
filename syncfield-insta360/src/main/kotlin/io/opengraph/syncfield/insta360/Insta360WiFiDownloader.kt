@@ -40,8 +40,22 @@ class Insta360WiFiDownloader(private val context: Context) {
     private val cameraHost = "192.168.42.1"
     private val cameraPort = 6666
 
+    data class BatchItem(
+        val episodeDir: File,
+        val streamId: String,
+        val remoteFileURI: String,
+        val destination: File,
+        val bleAckMonotonicNs: Long,
+    )
+
+    data class BatchResult(
+        val item: BatchItem,
+        val success: Boolean,
+        val error: String? = null,
+    )
+
     /**
-     * Atomically: join camera AP → probe reachability → fetch clip →
+     * Atomically: join camera AP -> probe reachability -> fetch clip ->
      * release network request.
      *
      * Returns the size in bytes of the downloaded file.
@@ -60,6 +74,40 @@ class Insta360WiFiDownloader(private val context: Context) {
             waitForReachability(cm)
             return fetchResource(cm, remoteFileURI, destination, progress)
         } finally {
+            runCatching { cm.bindProcessToNetwork(null) }
+            runCatching { cm.unregisterNetworkCallback(callback) }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    suspend fun downloadBatch(
+        ssid: String,
+        passphrase: String,
+        items: List<BatchItem>,
+        onItemStart: (BatchItem) -> Unit,
+        progress: (BatchItem, Double) -> Unit,
+    ): List<BatchResult> {
+        if (items.isEmpty()) return emptyList()
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = applyNetworkSuggestion(cm, ssid, passphrase)
+        return try {
+            waitForReachability(cm)
+            items.map { item ->
+                runCatching {
+                    onItemStart(item)
+                    fetchResource(
+                        cm = cm,
+                        remoteFileURI = item.remoteFileURI,
+                        destination = item.destination,
+                        progress = { progress(item, it) },
+                    )
+                    BatchResult(item, success = true)
+                }.getOrElse {
+                    BatchResult(item, success = false, error = it.localizedMessage ?: it.toString())
+                }
+            }
+        } finally {
+            runCatching { cm.bindProcessToNetwork(null) }
             runCatching { cm.unregisterNetworkCallback(callback) }
         }
     }

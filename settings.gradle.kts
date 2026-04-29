@@ -11,6 +11,13 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven {
+            url = uri("https://androidsdk.insta360.com/repository/maven-public/")
+            credentials {
+                username = "insta360guest"
+                password = "EXMSjSo8OeOrjU7d"
+            }
+        }
     }
 }
 

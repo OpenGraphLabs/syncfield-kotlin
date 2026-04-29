@@ -13,6 +13,7 @@ mockk = "1.13.11"
 robolectric = "4.12.2"
 truth = "1.4.2"
 turbine = "1.1.0"
+insta = "1.10.1"
 
 [libraries]
 kotlin-stdlib            = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
@@ -38,6 +39,7 @@ robolectric              = { module = "org.robolectric:robolectric", version.ref
 truth                    = { module = "com.google.truth:truth", version.ref = "truth" }
 turbine                  = { module = "app.cash.turbine:turbine", version.ref = "turbine" }
 kotlinx-coroutines-test  = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+insta-camera             = { module = "com.arashivision.sdk:sdkcamera", version.ref = "insta" }
 
 [plugins]
 android-library          = { id = "com.android.library", version.ref = "agp" }

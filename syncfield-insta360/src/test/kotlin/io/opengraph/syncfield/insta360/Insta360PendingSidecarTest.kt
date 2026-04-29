@@ -51,6 +51,25 @@ class Insta360PendingSidecarTest {
             Insta360PendingSidecar("cam_x", "ux", "nx", "/x", 3L))
 
         val all = Insta360PendingSidecar.scanRecursive(tmp.root)
-        assertThat(all.map { it.sidecar.streamId }).containsExactly("cam_a", "cam_b")
+        assertThat(all.map { it.sidecar.streamId }).containsExactly("cam_a", "cam_b", "cam_x")
+    }
+
+    @Test
+    fun `write helper fills role and saved timestamp`() {
+        val ep = tmp.newFolder("ep_20260427_test_role")
+        Insta360PendingSidecar.write(
+            episodeDir = ep,
+            streamId = "cam_wrist_left",
+            cameraFileURI = "/clip.mp4",
+            bleUuid = "uuid-left",
+            bleName = "GO 3S",
+            role = "left",
+            bleAckNs = 42L,
+        )
+
+        val sidecar = Insta360PendingSidecar.scan(ep).single()
+        assertThat(sidecar.role).isEqualTo("left")
+        assertThat(sidecar.savedAt).isNotEmpty()
+        assertThat(sidecar.bleAckMonotonicNs).isEqualTo(42L)
     }
 }
