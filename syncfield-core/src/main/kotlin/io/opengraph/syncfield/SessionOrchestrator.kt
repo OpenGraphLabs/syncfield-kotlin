@@ -4,6 +4,7 @@ import io.opengraph.syncfield.audio.ChirpEmission
 import io.opengraph.syncfield.audio.ChirpPlayer
 import io.opengraph.syncfield.audio.ChirpSpec
 import io.opengraph.syncfield.audio.SilentChirpPlayer
+import io.opengraph.syncfield.writers.EventWriter
 import io.opengraph.syncfield.writers.Manifest
 import io.opengraph.syncfield.writers.ManifestWriter
 import io.opengraph.syncfield.writers.SessionLogWriter
@@ -13,6 +14,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -55,6 +57,7 @@ class SessionOrchestrator(
     private val stopChirpSpec: ChirpSpec? = ChirpSpec.defaultStop,
     private val postStartStabilizationMs: Double = 200.0,
     private val preStopTailMarginMs: Double = 200.0,
+    private var handQualityConfig: HandQualityConfig = HandQualityConfig.Default,
 ) {
 
     private val mutex = Mutex()
@@ -64,6 +67,10 @@ class SessionOrchestrator(
     private val streams: MutableList<SyncFieldStream> = mutableListOf()
     private var sessionId: String = ""
     private var logWriter: SessionLogWriter? = null
+    private var activeClock: SessionClock? = null
+    private var eventWriter: EventWriter? = null
+    private var handQualityMonitor: HandQualityMonitor? = null
+    private var recordingStartMonotonicNs: Long = 0L
 
     private var startEmission: ChirpEmission? = null
     private var stopEmission: ChirpEmission? = null
@@ -132,6 +139,15 @@ class SessionOrchestrator(
             val writer = SessionLogWriter(File(episodeDirectory, "session.log"))
             logWriter = writer
             writer.append(kind = "state", detail = "connected->recording")
+            activeClock = clock
+            recordingStartMonotonicNs = clock.nowMonotonicNs()
+            val evWriter = factory.makeEventWriter()
+            eventWriter = evWriter
+            handQualityMonitor = HandQualityMonitor(
+                config = handQualityConfig,
+                recordingStartMonotonicNs = recordingStartMonotonicNs,
+                eventWriter = evWriter,
+            )
 
             if (countdownMs > 0) delay(countdownMs)
 
@@ -238,6 +254,22 @@ class SessionOrchestrator(
             }
             logWriter?.append(kind = "state", detail = "recording->stopping")
 
+            val monitor = handQualityMonitor
+            if (monitor != null) {
+                val stopNs = activeClock?.nowMonotonicNs() ?: recordingStartMonotonicNs
+                val stats = monitor.qualityStats(
+                    recordingStartMonotonicNs = recordingStartMonotonicNs,
+                    stopMonotonicNs = stopNs,
+                )
+                monitor.finalize(stopMonotonicNs = stopNs, stopFrame = -1)
+                val summary = HandQualitySummaryBuilder.build(stats, handQualityConfig)
+                runCatching {
+                    HandQualitySummaryBuilder.write(summary, File(episodeDirectory, "hand_quality.json"))
+                }
+            }
+            eventWriter = null
+            handQualityMonitor = null
+
             // Write manifest at stop time too — host apps that defer
             // ingest still need a manifest in the episode directory.
             val manifestResults: Map<String, Result<StreamIngestReport>> =
@@ -330,7 +362,10 @@ class SessionOrchestrator(
             val report = results[s.streamId]?.getOrNull()
             Manifest.StreamEntry(
                 streamId    = s.streamId,
-                filePath    = report?.filePath ?: "${s.streamId}.jsonl",
+                filePath    = report?.filePath ?: defaultFilePath(
+                    streamId = s.streamId,
+                    kind = if (s.capabilities.producesFile) "video" else "sensor",
+                ),
                 frameCount  = report?.frameCount ?: 0,
                 kind        = if (s.capabilities.producesFile) "video" else "sensor",
                 capabilities = s.capabilities,
@@ -343,5 +378,47 @@ class SessionOrchestrator(
             streams = entries,
         )
         ManifestWriter.write(manifest, File(episodeDirectory, "manifest.json"))
+    }
+
+    private fun defaultFilePath(streamId: String, kind: String): String =
+        if (kind == "video") "$streamId.mp4" else "$streamId.jsonl"
+
+    suspend fun setHandQualityConfig(config: HandQualityConfig) = mutex.withLock {
+        handQualityConfig = config
+    }
+
+    suspend fun handQualityEvents(): Flow<HandQualityEvent> = mutex.withLock {
+        handQualityMonitor?.events ?: kotlinx.coroutines.flow.emptyFlow()
+    }
+
+    suspend fun ingestHandObservations(
+        observations: List<HandObservation>,
+        frame: Int,
+        monotonicNs: Long,
+    ) {
+        val monitor = mutex.withLock { handQualityMonitor }
+        monitor?.ingest(observations, frame, monotonicNs)
+    }
+
+    suspend fun logEvent(
+        kind: String,
+        monotonicNs: Long,
+        endMonotonicNs: Long?,
+        payload: Map<String, Any?>,
+    ) {
+        val writer = mutex.withLock { eventWriter }
+        val ev = writer ?: return
+        if (endMonotonicNs != null && endMonotonicNs != monotonicNs) {
+            val handle = ev.appendIntervalStart(
+                kind = kind,
+                startMonotonicNs = monotonicNs,
+                startFrame = -1,
+                payload = payload,
+            )
+            ev.closeInterval(handle, endMonotonicNs, endFrame = -1)
+        } else {
+            ev.appendPoint(kind, monotonicNs, payload)
+        }
+        ev.flush()
     }
 }

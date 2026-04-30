@@ -15,6 +15,9 @@ class WriterFactory(val episodeDirectory: File) {
     fun makeSensorWriter(streamId: String): SensorWriter =
         SensorWriter(File(episodeDirectory, "$streamId.jsonl"))
 
+    fun makeEventWriter(streamId: String = "cam_ego"): EventWriter =
+        EventWriter(File(episodeDirectory, "events.jsonl"), streamId)
+
     fun videoFile(streamId: String, extension: String = "mp4"): File =
         File(episodeDirectory, "$streamId.$extension")
 }
