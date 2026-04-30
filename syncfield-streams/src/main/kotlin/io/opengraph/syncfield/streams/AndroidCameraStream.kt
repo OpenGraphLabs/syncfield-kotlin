@@ -3,8 +3,13 @@ package io.opengraph.syncfield.streams
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.util.Log
 import android.util.Size
+import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -44,6 +49,8 @@ import java.io.File
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.atan
+import kotlin.math.max
 
 /**
  * Android equivalent of `iPhoneCameraStream`. Built on CameraX so the
@@ -97,11 +104,16 @@ class AndroidCameraStream @JvmOverloads constructor(
     private var preview: Preview? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var imageAnalysis: ImageAnalysis? = null
+    @Volatile private var targetRotation: Int = Surface.ROTATION_0
 
     private var recording: Recording? = null
     private var stampWriter: StreamWriter? = null
     @Volatile private var frameCount: Int = 0
     @Volatile private var isRecording: Boolean = false
+    @Volatile private var useWidestBackCamera: Boolean = true
+    @Volatile private var wideCameraFallbackAttempted: Boolean = false
+    @Volatile private var previewProbeFrameCount: Int = 0
+    @Volatile private var blackPreviewFrameCount: Int = 0
 
     private var healthBus: HealthBus? = null
     private var outputFile: File? = null
@@ -130,9 +142,11 @@ class AndroidCameraStream @JvmOverloads constructor(
 
     override suspend fun connect(context: StreamConnectContext) {
         healthBus = context.healthBus
-        cameraProvider = obtainCameraProvider()
-        configureUseCases()
-        bindToLifecycle()
+        withContext(Dispatchers.Main) {
+            cameraProvider = obtainCameraProvider()
+            configureUseCases()
+            bindToLifecycle()
+        }
         healthBus?.publish(HealthEvent.StreamConnected(streamId))
     }
 
@@ -148,25 +162,36 @@ class AndroidCameraStream @JvmOverloads constructor(
 
     private fun configureUseCases() {
         val targetSize = Size(videoSettings.width, videoSettings.height)
-        val resolutionSelector = ResolutionSelector.Builder()
+        val captureResolutionSelector = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(targetSize,
                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
             )
             .build()
+        val analysisResolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(Size(640, 360),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+            )
+            .build()
 
         preview = Preview.Builder()
-            .setResolutionSelector(resolutionSelector)
+            .setResolutionSelector(captureResolutionSelector)
+            .setTargetRotation(targetRotation)
             .build()
 
         val recorder = Recorder.Builder()
             .setQualitySelector(qualitySelectorFor(videoSettings))
             .build()
-        videoCapture = VideoCapture.withOutput(recorder)
+        videoCapture = VideoCapture.withOutput(recorder).also {
+            it.targetRotation = targetRotation
+        }
 
         imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setResolutionSelector(resolutionSelector)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setResolutionSelector(analysisResolutionSelector)
+            .setTargetRotation(targetRotation)
             .build()
             .also { ia ->
                 ia.setAnalyzer(cameraExecutor) { proxy ->
@@ -180,11 +205,159 @@ class AndroidCameraStream @JvmOverloads constructor(
     private fun bindToLifecycle() {
         val provider = cameraProvider ?: return
         provider.unbindAll()
+        val selectedCameraSelector = if (useWidestBackCamera) {
+            widestBackCameraSelector(provider) ?: cameraSelector
+        } else {
+            cameraSelector
+        }
         camera = provider.bindToLifecycle(
             lifecycleOwner,
-            cameraSelector,
+            selectedCameraSelector,
             preview, videoCapture, imageAnalysis,
         )
+        applyWidestZoom(camera)
+    }
+
+    fun setTargetRotation(rotation: Int) {
+        if (targetRotation == rotation) return
+        targetRotation = rotation
+        preview?.targetRotation = rotation
+        imageAnalysis?.targetRotation = rotation
+        videoCapture?.targetRotation = rotation
+    }
+
+    private fun widestBackCameraSelector(provider: ProcessCameraProvider): CameraSelector? {
+        val candidates = provider.availableCameraInfos.mapNotNull { info ->
+            val camera2Info = runCatching { Camera2CameraInfo.from(info) }.getOrNull()
+                ?: return@mapNotNull null
+            val lensFacing = runCatching {
+                camera2Info.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+            }.getOrNull()
+            if (lensFacing != CameraCharacteristics.LENS_FACING_BACK) return@mapNotNull null
+
+            val fov = horizontalFovDegrees(info) ?: return@mapNotNull null
+            val cameraId = runCatching { camera2Info.cameraId }.getOrNull()
+                ?: return@mapNotNull null
+            CameraFovCandidate(cameraId = cameraId, horizontalFovDegrees = fov)
+        }
+
+        val widest = candidates.maxByOrNull { it.horizontalFovDegrees } ?: return null
+        Log.i(
+            TAG,
+            "Selected widest back camera id=${widest.cameraId} fov=${"%.1f".format(widest.horizontalFovDegrees)}",
+        )
+        return CameraSelector.Builder()
+            .addCameraFilter { infos ->
+                infos.filter { info ->
+                    runCatching { Camera2CameraInfo.from(info).cameraId == widest.cameraId }
+                        .getOrDefault(false)
+                }
+            }
+            .build()
+    }
+
+    private fun horizontalFovDegrees(info: CameraInfo): Double? {
+        val camera2Info = runCatching { Camera2CameraInfo.from(info) }.getOrNull()
+            ?: return null
+        val focalLengths = camera2Info
+            .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?: return null
+        val minFocalLength = focalLengths.minOrNull()?.takeIf { it > 0f } ?: return null
+        val sensorSize = camera2Info
+            .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            ?: return null
+        val sensorLongEdge = max(sensorSize.width, sensorSize.height)
+        if (sensorLongEdge <= 0f) return null
+        return Math.toDegrees(2.0 * atan(sensorLongEdge / (2.0 * minFocalLength)))
+    }
+
+    private data class CameraFovCandidate(
+        val cameraId: String,
+        val horizontalFovDegrees: Double,
+    )
+
+    private fun applyWidestZoom(boundCamera: Camera?) {
+        val camera = boundCamera ?: return
+        val minZoomRatio = camera.cameraInfo.zoomState.value?.minZoomRatio ?: return
+        if (minZoomRatio < 1f) {
+            runCatching { camera.cameraControl.setZoomRatio(minZoomRatio) }
+        }
+    }
+
+    private fun maybeFallbackFromBlackWideCamera(proxy: ImageProxy) {
+        if (!useWidestBackCamera || wideCameraFallbackAttempted || previewProbeFrameCount >= 45) {
+            return
+        }
+
+        val avgLuma = averageLuma(proxy) ?: return
+        previewProbeFrameCount += 1
+        if (avgLuma <= 2.0) {
+            blackPreviewFrameCount += 1
+        } else {
+            blackPreviewFrameCount = 0
+        }
+
+        if (previewProbeFrameCount >= 24 && blackPreviewFrameCount >= 24) {
+            wideCameraFallbackAttempted = true
+            useWidestBackCamera = false
+            Log.w(TAG, "Widest back camera produced black frames; falling back to default back camera.")
+            ioScope.launch(Dispatchers.Main) {
+                runCatching {
+                    val provider = cameraProvider ?: return@launch
+                    provider.unbindAll()
+                    camera = provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview, videoCapture, imageAnalysis,
+                    )
+                    applyWidestZoom(camera)
+                }.onFailure { error ->
+                    Log.w(TAG, "Default back camera fallback failed", error)
+                }
+            }
+        }
+    }
+
+    private fun averageLuma(proxy: ImageProxy): Double? {
+        val buffer = proxy.planes.firstOrNull()?.buffer ?: return null
+        val remaining = buffer.remaining()
+        if (remaining <= 0) return null
+
+        if (proxy.format == android.graphics.PixelFormat.RGBA_8888 ||
+            proxy.planes.firstOrNull()?.pixelStride == 4
+        ) {
+            val samplePixels = minOf(remaining / 4, 512)
+            if (samplePixels <= 0) return null
+            val stepPixels = max(1, (remaining / 4) / samplePixels)
+            val limit = buffer.limit()
+            var index = buffer.position()
+            var sum = 0.0
+            var count = 0
+            while (index + 3 < limit && count < samplePixels) {
+                val r = buffer.get(index).toInt() and 0xFF
+                val g = buffer.get(index + 1).toInt() and 0xFF
+                val b = buffer.get(index + 2).toInt() and 0xFF
+                sum += 0.299 * r + 0.587 * g + 0.114 * b
+                count += 1
+                index += stepPixels * 4
+            }
+            if (count == 0) return null
+            return sum / count.toDouble()
+        }
+
+        val sampleCount = minOf(remaining, 512)
+        val step = max(1, remaining / sampleCount)
+        val limit = buffer.limit()
+        var index = buffer.position()
+        var sum = 0L
+        var count = 0
+        while (index < limit && count < sampleCount) {
+            sum += (buffer.get(index).toInt() and 0xFF)
+            count += 1
+            index += step
+        }
+        if (count == 0) return null
+        return sum.toDouble() / count.toDouble()
     }
 
     override suspend fun startRecording(clock: SessionClock, writerFactory: WriterFactory) {
@@ -199,27 +372,29 @@ class AndroidCameraStream @JvmOverloads constructor(
         val capture = videoCapture ?: throw StreamError(streamId,
             IllegalStateException("videoCapture not initialised — connect() must run first"))
 
-        val outputOptions = FileOutputOptions.Builder(output).build()
-        var pendingRecording = capture.output.prepareRecording(context, outputOptions)
-        val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (hasMic) {
-            @SuppressLint("MissingPermission")
-            val withAudio = pendingRecording.withAudioEnabled()
-            pendingRecording = withAudio
-        }
-
         val started = CompletableDeferred<Unit>()
-        recording = pendingRecording.start(cameraExecutor) { event ->
-            when (event) {
-                is VideoRecordEvent.Start -> {
-                    isRecording = true
-                    if (!started.isCompleted) started.complete(Unit)
+        withContext(Dispatchers.Main) {
+            val outputOptions = FileOutputOptions.Builder(output).build()
+            var pendingRecording = capture.output.prepareRecording(context, outputOptions)
+            val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (hasMic) {
+                @SuppressLint("MissingPermission")
+                val withAudio = pendingRecording.withAudioEnabled()
+                pendingRecording = withAudio
+            }
+
+            recording = pendingRecording.start(cameraExecutor) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        isRecording = true
+                        if (!started.isCompleted) started.complete(Unit)
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        isRecording = false
+                    }
+                    else -> Unit
                 }
-                is VideoRecordEvent.Finalize -> {
-                    isRecording = false
-                }
-                else -> Unit
             }
         }
         // Wait for the recorder to actually transition to "recording"
@@ -276,6 +451,7 @@ class AndroidCameraStream @JvmOverloads constructor(
     }
 
     private fun onAnalysisFrame(proxy: ImageProxy) {
+        maybeFallbackFromBlackWideCamera(proxy)
         val tsNs = proxy.imageInfo.timestamp
 
         // Frame processor — runs whether or not we're recording so
@@ -308,5 +484,9 @@ class AndroidCameraStream @JvmOverloads constructor(
             else                    -> Quality.SD
         }
         return QualitySelector.from(q)
+    }
+
+    private companion object {
+        const val TAG = "AndroidCameraStream"
     }
 }

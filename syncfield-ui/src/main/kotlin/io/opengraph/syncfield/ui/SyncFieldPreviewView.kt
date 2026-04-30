@@ -2,13 +2,14 @@ package io.opengraph.syncfield.ui
 
 import android.content.Context
 import android.util.AttributeSet
+import android.util.Log
+import android.view.Surface
 import android.widget.FrameLayout
 import androidx.camera.view.PreviewView
 import io.opengraph.syncfield.streams.AndroidCameraStream
 import io.opengraph.syncfield.streams.SyncFieldCameraSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
@@ -38,7 +39,11 @@ class SyncFieldPreviewView @JvmOverloads constructor(
     private val previewView = PreviewView(context).apply {
         layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         scaleType = PreviewView.ScaleType.FILL_CENTER
-        implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+        // TextureView-backed preview handles React Native overlays and
+        // runtime orientation changes more predictably than SurfaceView.
+        // VideoCapture and ImageAnalysis stay bound as separate CameraX
+        // use cases, so this only affects the on-screen preview surface.
+        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
     }
 
     /**
@@ -57,6 +62,7 @@ class SyncFieldPreviewView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        boundStream = null
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         observerScope = scope
         scope.launch {
@@ -70,12 +76,32 @@ class SyncFieldPreviewView @JvmOverloads constructor(
                 }
             }
         }
+        previewView.post {
+            if (boundStream == null) {
+                SyncFieldCameraSession.activeStream.value?.let { bindInternal(it) }
+            }
+        }
     }
 
     override fun onDetachedFromWindow() {
         observerScope?.cancel()
         observerScope = null
+        boundStream = null
         super.onDetachedFromWindow()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w <= 0 || h <= 0) return
+        updateScaleTypeForBounds(w, h)
+        boundStream?.setTargetRotation(currentTargetRotation())
+        if (boundStream != null) return
+        val stream = boundStream ?: SyncFieldCameraSession.activeStream.value
+        stream?.let {
+            previewView.post {
+                if (boundStream == null) bindInternal(it)
+            }
+        }
     }
 
     /**
@@ -87,16 +113,55 @@ class SyncFieldPreviewView @JvmOverloads constructor(
     fun bind(stream: AndroidCameraStream) = bindInternal(stream)
 
     private fun bindInternal(stream: AndroidCameraStream) {
-        val live = stream.livePreview
-            ?: throw IllegalStateException(
-                "AndroidCameraStream.livePreview is null — call connect() before binding"
-            )
+        if (!isAttachedToWindow) return
+        if (width <= 0 || height <= 0) {
+            postDelayed({
+                if (isAttachedToWindow && boundStream !== stream) bindInternal(stream)
+            }, 50L)
+            return
+        }
+
+        val live = stream.livePreview ?: run {
+            // The bridge normally publishes only after connect(), but keep
+            // this view tolerant of early manual binding. Retrying preserves
+            // the collector instead of cancelling it on an exception.
+            postDelayed({
+                if (isAttachedToWindow && boundStream !== stream) bindInternal(stream)
+            }, 50L)
+            return
+        }
+        updateScaleTypeForBounds(width, height)
+        stream.setTargetRotation(currentTargetRotation())
         live.setSurfaceProvider(previewView.surfaceProvider)
         boundStream = stream
+        Log.i(
+            TAG,
+            "Bound camera preview ${width}x$height scaleType=${previewView.scaleType} rotation=${currentTargetRotation()}",
+        )
+    }
+
+    private fun currentTargetRotation(): Int {
+        val displayRotation = display?.rotation ?: previewView.display?.rotation
+        if (displayRotation != null && displayRotation != Surface.ROTATION_0) {
+            return displayRotation
+        }
+        return if (width > height) Surface.ROTATION_90 else Surface.ROTATION_0
     }
 
     /** Set the [PreviewView] scale type. Default is [PreviewView.ScaleType.FILL_CENTER]. */
     fun setScaleType(type: PreviewView.ScaleType) {
         previewView.scaleType = type
+    }
+
+    private fun updateScaleTypeForBounds(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        // The recording view is a camera-first surface. It should always fill
+        // the phone, including landscape. FIT_CENTER preserves every camera
+        // pixel but creates a small, letterboxed preview on 19.5:9 phones.
+        previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+    }
+
+    private companion object {
+        const val TAG = "SyncFieldPreviewView"
     }
 }
