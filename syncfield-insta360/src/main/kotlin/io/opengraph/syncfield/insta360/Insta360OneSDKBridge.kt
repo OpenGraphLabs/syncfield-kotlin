@@ -2,6 +2,7 @@ package io.opengraph.syncfield.insta360
 
 import android.app.Application
 import android.content.Context
+import android.net.Network
 import com.arashivision.sdkcamera.InstaCameraSDK
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.log.LogLv
@@ -21,10 +22,12 @@ import java.io.File
 internal object Insta360OneSDKBridge {
 
     val available: Boolean by lazy {
-        runCatching {
-            Class.forName("com.arashivision.sdkcamera.camera.InstaCameraManager")
-            Class.forName("com.arashivision.sdkcamera.InstaCameraSDK")
-        }.isSuccess
+        Insta360OneSDKAvailability.areClassesAvailable(
+            listOf(
+                "com.arashivision.sdkcamera.camera.InstaCameraManager",
+                "com.arashivision.sdkcamera.InstaCameraSDK",
+            )
+        )
     }
 
     private val initLock = Any()
@@ -53,8 +56,23 @@ internal object Insta360OneSDKBridge {
             return InstaCameraManager.getInstance()
         }
 
+    fun bindNetwork(network: Network) {
+        if (!available) return
+        manager.setNetIdToCamera(network.networkHandle)
+    }
+
     fun stableId(device: BleDevice): String =
         listOf(device.key, device.mac, device.name)
             .firstOrNull { !it.isNullOrBlank() }
             ?: "unknown"
+}
+
+internal object Insta360OneSDKAvailability {
+    fun areClassesAvailable(
+        classNames: List<String>,
+        classLoader: ClassLoader =
+            Insta360OneSDKAvailability::class.java.classLoader ?: ClassLoader.getSystemClassLoader(),
+    ): Boolean = classNames.all { name ->
+        runCatching { Class.forName(name, false, classLoader) }.isSuccess
+    }
 }

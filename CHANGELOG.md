@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0-SNAPSHOT] — 2026-05-10
+
+### Added
+
+- `Insta360Support` capability probe so host apps can fail fast when the
+  OneSDK is absent.
+- Unit coverage for command queue serialization, Wi-Fi probe policy, and
+  OneSDK availability probing.
+
+### Changed
+
+- Replaced the single BLE command mutex with a per-device command queue
+  plus a shared SDK-critical section for `InstaCameraManager`.
+- Matched Android Insta360 Wi-Fi reachability probing to the iOS
+  eight-step backoff policy and wait briefly for the default network to
+  restore after release.
+
 ## [0.3.0] — 2026-04-27
 
 Initial Kotlin port of [syncfield-swift](https://github.com/OpenGraphLabs/syncfield-swift)

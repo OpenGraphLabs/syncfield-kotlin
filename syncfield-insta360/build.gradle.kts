@@ -15,6 +15,7 @@ android {
         // removed for app-side use in Android 10. Other syncfield
         // modules stay at API 26 — only Insta360 needs this floor.
         minSdk = 29
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }
 
@@ -45,4 +46,8 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
     testImplementation("androidx.test:rules:1.5.0")
+
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation(libs.truth)
 }

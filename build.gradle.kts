@@ -5,10 +5,10 @@ plugins {
     alias(libs.plugins.kotlin.serialization) apply false
 }
 
-// Stable coordinates so composite builds in host apps (e.g. egonaut)
-// resolve `io.opengraph.syncfield:<module>:0.3.0` against the
+// Stable coordinates so composite builds in host apps (e.g. og-skill)
+// resolve `io.opengraph.syncfield:<module>:0.4.0-SNAPSHOT` against the
 // included build's modules without requiring a Maven publish.
 subprojects {
     group = "io.opengraph.syncfield"
-    version = "0.3.0"
+    version = "0.4.0-SNAPSHOT"
 }
