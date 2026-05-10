@@ -7,7 +7,9 @@ import android.hardware.camera2.CameraCharacteristics
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
@@ -226,6 +228,7 @@ class AndroidCameraStream @JvmOverloads constructor(
         videoCapture?.targetRotation = rotation
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun widestBackCameraSelector(provider: ProcessCameraProvider): CameraSelector? {
         val candidates = provider.availableCameraInfos.mapNotNull { info ->
             val camera2Info = runCatching { Camera2CameraInfo.from(info) }.getOrNull()
@@ -256,6 +259,7 @@ class AndroidCameraStream @JvmOverloads constructor(
             .build()
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun horizontalFovDegrees(info: CameraInfo): Double? {
         val camera2Info = runCatching { Camera2CameraInfo.from(info) }.getOrNull()
             ?: return null
