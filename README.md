@@ -6,12 +6,11 @@ IMU, FSR gloves, and Insta360 cameras share a single host clock and
 produce a common on-disk layout that the syncfield Python pipeline
 ingests.
 
-> **Status — v0.3.0 initial port.** The build is green and the JVM-side
-> orchestration logic is fully unit-tested (37 tests, 0 failures), but
-> the camera, motion, BLE, and Insta360 paths have only been built and
-> not yet exercised on a real device. Insta360 SDK calls are reflective
-> stubs awaiting the OneSDK Android AAR — see [Insta360 module](#insta360-module).
-> Track real-device readiness in the GitHub issues.
+> **Status — v0.4.0 Android app readiness release.** The build is green,
+> the JVM-side orchestration logic is unit-tested, and the Android SDK is
+> published from the `v0.4.0` GitHub tag for host apps that do not want a
+> sibling composite build. Insta360 SDK calls are still gated by runtime
+> OneSDK availability — see [Insta360 module](#insta360-module).
 
 ## Modules
 
@@ -88,10 +87,36 @@ sdkmanager --licenses        # accept y/y/...
 echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
 ```
 
+## Using the released SDK
+
+The public release is available through JitPack. Add the repository to
+the host app's dependency repositories:
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven("https://jitpack.io")
+    }
+}
+```
+
+Then depend on the modules the host app needs:
+
+```kotlin
+dependencies {
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-core:v0.4.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-streams:v0.4.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-tactile:v0.4.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-insta360:v0.4.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-ui:v0.4.0")
+}
+```
+
 ## Using as a composite build
 
-Host apps that don't want to publish to a Maven repository can wire
-the SDK in directly:
+For local SDK development, host apps can still wire the SDK in directly:
 
 ```kotlin
 // settings.gradle (host app)
@@ -101,16 +126,16 @@ includeBuild('../path/to/syncfield-kotlin')
 ```kotlin
 // app/build.gradle (host app)
 dependencies {
-    implementation 'io.opengraph.syncfield:syncfield-core:0.3.0'
-    implementation 'io.opengraph.syncfield:syncfield-streams:0.3.0'
-    implementation 'io.opengraph.syncfield:syncfield-tactile:0.3.0'
-    implementation 'io.opengraph.syncfield:syncfield-insta360:0.3.0'
-    implementation 'io.opengraph.syncfield:syncfield-ui:0.3.0'
+    implementation("io.opengraph.syncfield:syncfield-core:0.4.0")
+    implementation("io.opengraph.syncfield:syncfield-streams:0.4.0")
+    implementation("io.opengraph.syncfield:syncfield-tactile:0.4.0")
+    implementation("io.opengraph.syncfield:syncfield-insta360:0.4.0")
+    implementation("io.opengraph.syncfield:syncfield-ui:0.4.0")
 }
 ```
 
-The egonaut Android app uses exactly this pattern — see
-`mobile/android/settings.gradle` and `mobile/android/app/build.gradle`.
+The egonaut Android app should use the released JitPack artifacts for
+normal builds and reserve composite builds for active SDK development.
 
 ## Quick start
 

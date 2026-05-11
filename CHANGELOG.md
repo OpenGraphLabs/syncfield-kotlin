@@ -4,10 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.4.0-SNAPSHOT] — 2026-05-10
+## [0.4.0] — 2026-05-11
 
 ### Added
 
+- JitPack/Maven publication metadata for all Android SDK modules.
 - `Insta360Support` capability probe so host apps can fail fast when the
   OneSDK is absent.
 - Unit coverage for command queue serialization, Wi-Fi probe policy, and
@@ -15,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Promoted the SDK version from `0.4.0-SNAPSHOT` to the stable `0.4.0`
+  release.
 - Replaced the single BLE command mutex with a per-device command queue
   plus a shared SDK-critical section for `InstaCameraManager`.
 - Matched Android Insta360 Wi-Fi reachability probing to the iOS
