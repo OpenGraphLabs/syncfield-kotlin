@@ -11,8 +11,6 @@ import com.clj.fastble.data.BleDevice
 import io.opengraph.syncfield.SessionClock
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -29,10 +27,10 @@ import kotlinx.coroutines.withTimeout
  * 5. [unpair] - disconnect.
  *
  * Android's public SDK exposes `InstaCameraManager` as a process-wide
- * singleton. SyncField therefore serializes every BLE command through a
- * global mutex. For multi-wrist sessions, start/stop commands are sent to
- * each camera sequentially and each stream stores the host-side ACK time
- * returned by its own command completion.
+ * singleton. SyncField therefore uses a per-device command queue, with a
+ * shared SDK-critical section only around calls that touch the singleton
+ * manager. For multi-wrist sessions, each stream stores the host-side ACK
+ * time returned by its own command completion.
  */
 class Insta360BLEController(
     private val context: Context,
@@ -51,11 +49,12 @@ class Insta360BLEController(
         private set
 
     private var bleDevice: BleDevice? = initialDevice
+    private val commandQueue = Insta360CommandQueue.shared
 
     suspend fun pair() {
         setup()
         val device = bleDevice ?: scanFirstGoCamera().also { bleDevice = it }
-        sdkMutex.withLock {
+        commandQueue.runDeviceCommand(commandId(device), timeoutMs = 45_000L, retries = 1) {
             connectDeviceWithRetry(device)
             setConnectedIdentity(device)
         }
@@ -64,7 +63,8 @@ class Insta360BLEController(
     suspend fun unpair() {
         if (!Insta360OneSDKBridge.available) return
         setup()
-        sdkMutex.withLock {
+        val device = bleDevice
+        commandQueue.runDeviceCommand(commandId(device), timeoutMs = 15_000L, retries = 0) {
             runCatching { manager.disconnectBle() }
         }
         connectedDeviceUuid = null
@@ -79,7 +79,7 @@ class Insta360BLEController(
     suspend fun startRemoteRecording(clock: SessionClock): Long {
         setup()
         val device = requireDevice()
-        return sdkMutex.withLock {
+        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
             connectDeviceWithRetry(device)
             ensureNormalRecordMode()
             if (!manager.isSdCardEnabled) {
@@ -119,7 +119,7 @@ class Insta360BLEController(
     suspend fun stopRemoteRecording(): String {
         setup()
         val device = requireDevice()
-        return sdkMutex.withLock {
+        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 45_000L, retries = 1) {
             connectDeviceWithRetry(device)
             val file = CompletableDeferred<String>()
             val listener = object : ICaptureStatusListener {
@@ -162,7 +162,7 @@ class Insta360BLEController(
     suspend fun wifiCredentials(): Pair<String, String> {
         setup()
         val device = requireDevice()
-        return sdkMutex.withLock {
+        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
             connectDeviceWithRetry(device)
             runCatching { fetchCameraOptions() }
             val wifi = manager.wifiInfo
@@ -177,7 +177,7 @@ class Insta360BLEController(
     suspend fun triggerIdentifyPhoto() {
         setup()
         val device = requireDevice()
-        sdkMutex.withLock {
+        commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
             connectDeviceWithRetry(device)
             val result = CompletableDeferred<Unit>()
             val listener = object : ICaptureStatusListener {
@@ -220,40 +220,42 @@ class Insta360BLEController(
         bleDevice ?: throw Insta360Error.NotPaired
 
     private suspend fun scanFirstGoCamera(): BleDevice {
-        val found = CompletableDeferred<BleDevice>()
-        manager.setScanBleListener(object : IScanBleListener {
-            override fun onScanStartSuccess() = Unit
+        return commandQueue.runGlobalCommand(timeoutMs = 20_000L) {
+            val found = CompletableDeferred<BleDevice>()
+            manager.setScanBleListener(object : IScanBleListener {
+                override fun onScanStartSuccess() = Unit
 
-            override fun onScanStartFail() {
-                if (!found.isCompleted) {
-                    found.completeExceptionally(Insta360Error.CommandFailed("BLE scan failed"))
+                override fun onScanStartFail() {
+                    if (!found.isCompleted) {
+                        found.completeExceptionally(Insta360Error.CommandFailed("BLE scan failed"))
+                    }
                 }
-            }
 
-            override fun onScanning(bleDevice: BleDevice) {
-                if (Insta360BluetoothHub.shouldEmitDevice(bleDevice.name) && !found.isCompleted) {
-                    found.complete(bleDevice)
-                    manager.stopBleScan()
+                override fun onScanning(bleDevice: BleDevice) {
+                    if (Insta360BluetoothHub.shouldEmitDevice(bleDevice.name) && !found.isCompleted) {
+                        found.complete(bleDevice)
+                        manager.stopBleScan()
+                    }
                 }
-            }
 
-            override fun onScanFinish(list: List<BleDevice>) {
-                val device = list.firstOrNull { Insta360BluetoothHub.shouldEmitDevice(it.name) }
-                if (device != null && !found.isCompleted) {
-                    found.complete(device)
-                } else if (!found.isCompleted) {
-                    found.completeExceptionally(
-                        Insta360Error.CommandFailed("no Insta360 Go camera discovered")
-                    )
+                override fun onScanFinish(list: List<BleDevice>) {
+                    val device = list.firstOrNull { Insta360BluetoothHub.shouldEmitDevice(it.name) }
+                    if (device != null && !found.isCompleted) {
+                        found.complete(device)
+                    } else if (!found.isCompleted) {
+                        found.completeExceptionally(
+                            Insta360Error.CommandFailed("no Insta360 Go camera discovered")
+                        )
+                    }
                 }
+            })
+            try {
+                manager.startBleScan()
+                withTimeout(15_000) { found.await() }
+            } finally {
+                runCatching { manager.stopBleScan() }
+                manager.setScanBleListener(null)
             }
-        })
-        try {
-            manager.startBleScan()
-            return withTimeout(15_000) { found.await() }
-        } finally {
-            runCatching { manager.stopBleScan() }
-            manager.setScanBleListener(null)
         }
     }
 
@@ -352,8 +354,12 @@ class Insta360BLEController(
         return if (name.endsWith(".OSC")) name else "$name.OSC"
     }
 
+    private fun commandId(device: BleDevice?): String =
+        device?.let { Insta360OneSDKBridge.stableId(it) }
+            ?: connectedDeviceUuid
+            ?: "unpaired-${System.identityHashCode(this)}"
+
     companion object {
         private const val DEFAULT_WIFI_PASSWORD = "88888888"
-        internal val sdkMutex = Mutex()
     }
 }

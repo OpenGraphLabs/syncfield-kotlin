@@ -17,6 +17,21 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
+internal object Insta360WiFiReachabilityPolicy {
+    val probeDelaysMs: List<Long> = listOf(
+        1_000L,
+        1_000L,
+        1_500L,
+        2_000L,
+        2_500L,
+        3_000L,
+        4_000L,
+        5_000L,
+    )
+
+    const val restoreTimeoutMs: Long = 4_000L
+}
+
 /**
  * Switches the phone onto an Insta360 camera AP, downloads a clip from
  * the SDK socket, and tears down the network request afterwards so the
@@ -74,8 +89,7 @@ class Insta360WiFiDownloader(private val context: Context) {
             waitForReachability(cm)
             return fetchResource(cm, remoteFileURI, destination, progress)
         } finally {
-            runCatching { cm.bindProcessToNetwork(null) }
-            runCatching { cm.unregisterNetworkCallback(callback) }
+            releaseCameraNetwork(cm, callback)
         }
     }
 
@@ -107,8 +121,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                 }
             }
         } finally {
-            runCatching { cm.bindProcessToNetwork(null) }
-            runCatching { cm.unregisterNetworkCallback(callback) }
+            releaseCameraNetwork(cm, callback)
         }
     }
 
@@ -133,6 +146,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 cm.bindProcessToNetwork(network)
+                runCatching { Insta360OneSDKBridge.bindNetwork(network) }
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
             }
             override fun onUnavailable() {
@@ -157,17 +171,20 @@ class Insta360WiFiDownloader(private val context: Context) {
     }
 
     private suspend fun waitForReachability(cm: ConnectivityManager) {
-        repeat(3) {
-            if (probeOnce()) return
-            delay(1_000)
+        for ((index, delayMs) in Insta360WiFiReachabilityPolicy.probeDelaysMs.withIndex()) {
+            if (probeOnce(cm)) return
+            if (index < Insta360WiFiReachabilityPolicy.probeDelaysMs.lastIndex) {
+                delay(delayMs)
+            }
         }
         throw Insta360Error.CameraNotReachable
     }
 
-    private suspend fun probeOnce(): Boolean {
+    private fun probeOnce(cm: ConnectivityManager): Boolean {
         return runCatching {
             val url = URL("http://$cameraHost:$cameraPort/")
-            (url.openConnection() as HttpURLConnection).run {
+            val network = cm.boundNetworkForProcess
+            ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).run {
                 connectTimeout = 3_000
                 readTimeout = 3_000
                 requestMethod = "GET"
@@ -187,7 +204,8 @@ class Insta360WiFiDownloader(private val context: Context) {
         destination.parentFile?.mkdirs()
 
         val url = URL("http://$cameraHost:$cameraPort$remoteFileURI")
-        val conn = (url.openConnection() as HttpURLConnection).apply {
+        val network = cm.boundNetworkForProcess
+        val conn = ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 30_000
             requestMethod = "GET"
@@ -217,5 +235,37 @@ class Insta360WiFiDownloader(private val context: Context) {
             conn.disconnect()
         }
         return written
+    }
+
+    private suspend fun releaseCameraNetwork(
+        cm: ConnectivityManager,
+        callback: ConnectivityManager.NetworkCallback,
+    ) {
+        runCatching { cm.bindProcessToNetwork(null) }
+        runCatching { cm.unregisterNetworkCallback(callback) }
+        awaitNetworkRestore(cm, Insta360WiFiReachabilityPolicy.restoreTimeoutMs)
+    }
+
+    private suspend fun awaitNetworkRestore(cm: ConnectivityManager, maxWaitMs: Long) {
+        if (hasInternet(cm, cm.activeNetwork)) return
+
+        val restored = CompletableDeferred<Unit>()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (hasInternet(cm, network) && !restored.isCompleted) restored.complete(Unit)
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
+            .onFailure { return }
+        try {
+            withTimeoutOrNull(maxWaitMs) { restored.await() }
+        } finally {
+            runCatching { cm.unregisterNetworkCallback(cb) }
+        }
+    }
+
+    private fun hasInternet(cm: ConnectivityManager, network: Network?): Boolean {
+        val caps = network?.let { cm.getNetworkCapabilities(it) } ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 }
