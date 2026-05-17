@@ -31,6 +31,7 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            isReturnDefaultValues = true
         }
     }
 }
@@ -39,12 +40,15 @@ dependencies {
     api(project(":syncfield-core"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.process)
     implementation(libs.insta.camera)
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
+    testImplementation(libs.mockk)
+    testImplementation(libs.turbine)
     testImplementation("androidx.test:rules:1.5.0")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

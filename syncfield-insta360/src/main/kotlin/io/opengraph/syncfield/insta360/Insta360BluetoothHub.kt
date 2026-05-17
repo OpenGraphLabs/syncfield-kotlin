@@ -5,6 +5,9 @@ import com.arashivision.sdkcamera.camera.callback.IScanBleListener
 import com.clj.fastble.data.BleDevice
 import io.opengraph.syncfield.HealthEvent
 import io.opengraph.syncfield.SessionOrchestrator
+import io.opengraph.syncfield.insta360.logging.InstaLog
+import io.opengraph.syncfield.insta360.logging.InstaLogCategory
+import io.opengraph.syncfield.insta360.logging.InstaLogLevel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -37,10 +40,21 @@ object Insta360BluetoothHub {
     private val pairedControllers = ConcurrentHashMap<String, Insta360BLEController>()
     private val pairLocks = ConcurrentHashMap<String, Mutex>()
     @Volatile private var scanActive = false
+    @Volatile private var nativeScanner: Insta360NativeBleScanner? = null
 
-    /** Pure helper: accept Go-family cameras, matching iOS behaviour. */
-    fun shouldEmitDevice(name: String?): Boolean =
-        name?.lowercase()?.contains("go") == true
+    /**
+     * Filter for Insta360 Go-family BLE advertisements.
+     *
+     * Insta360 GO 3S advertises with names like `"GO 3S 12345"`, `"GO3S_12345"`,
+     * `"Insta360 GO 3S"`. Older models surface as `"GO"`, `"GO2"`, `"GO 2"`.
+     * Accept any name that matches the GO family OR the broader "insta" brand,
+     * since GO 3S firmware variants sometimes drop the "GO" prefix entirely.
+     */
+    fun shouldEmitDevice(name: String?): Boolean {
+        val n = name?.lowercase()?.trim() ?: return false
+        if (n.isEmpty()) return false
+        return n.contains("go") || n.contains("insta")
+    }
 
     fun streamId(forRole: String): String = "cam_wrist_$forRole"
 
@@ -50,22 +64,58 @@ object Insta360BluetoothHub {
             Insta360OneSDKBridge.setup(context)
             val manager = Insta360OneSDKBridge.manager
             manager.setScanBleListener(object : IScanBleListener {
-                override fun onScanStartSuccess() = Unit
+                override fun onScanStartSuccess() {
+                    InstaLog.log(InstaLogCategory.SCAN, event = "scan_started")
+                }
 
                 override fun onScanStartFail() {
                     scanActive = false
+                    InstaLog.log(
+                        InstaLogCategory.SCAN, level = InstaLogLevel.WARN,
+                        event = "scan_start_failed",
+                    )
                 }
 
                 override fun onScanning(bleDevice: BleDevice) {
+                    // Temporarily INFO so we can confirm whether the SDK scan
+                    // pipeline (which depends on IConfiguration filters) is
+                    // emitting GO3S devices, independent of the native scan
+                    // fallback. If `sdk_scan_callback` lines never appear,
+                    // the support patch isn't deep enough.
+                    InstaLog.log(
+                        InstaLogCategory.SCAN,
+                        level = InstaLogLevel.INFO,
+                        event = "sdk_scan_callback",
+                        fields = mapOf(
+                            "name" to (bleDevice.name ?: "null"),
+                            "mac" to (bleDevice.mac ?: "null"),
+                            "rssi" to bleDevice.rssi,
+                            "accepted" to shouldEmitDevice(bleDevice.name),
+                        ),
+                    )
                     handleScanHit(bleDevice)
                 }
 
                 override fun onScanFinish(list: List<BleDevice>) {
+                    InstaLog.log(
+                        InstaLogCategory.SCAN, event = "scan_finished",
+                        fields = mapOf("total" to list.size),
+                    )
                     list.forEach { handleScanHit(it) }
                 }
             })
             scanActive = true
             manager.startBleScan()
+            InstaLog.log(InstaLogCategory.SCAN, event = "scan_requested")
+
+            // Parallel native scanner — SDK's internal filter drops every
+            // advertisement until per-camera support config is loaded
+            // (chicken-and-egg). Native scanner emits independently into
+            // the same `discoveries` SharedFlow via handleScanHit.
+            nativeScanner?.stop()
+            nativeScanner = Insta360NativeBleScanner(context) { device ->
+                handleScanHit(device)
+            }.also { it.start() }
         }
         discoveries.asSharedFlow()
     }
@@ -76,6 +126,8 @@ object Insta360BluetoothHub {
             runCatching { Insta360OneSDKBridge.manager.stopBleScan() }
             runCatching { Insta360OneSDKBridge.manager.setScanBleListener(null) }
         }
+        nativeScanner?.stop()
+        nativeScanner = null
         scanActive = false
     }
 
@@ -136,12 +188,21 @@ object Insta360BluetoothHub {
         if (!shouldEmitDevice(device.name)) return
         val uuid = Insta360OneSDKBridge.stableId(device)
         scannedDevices[uuid] = device
-        discoveries.tryEmit(
+        val emitted = discoveries.tryEmit(
             DiscoveredInsta360(
                 uuid = uuid,
                 name = device.name.orEmpty(),
                 rssi = device.rssi,
             )
+        )
+        InstaLog.log(
+            InstaLogCategory.SCAN, event = "scan_hit",
+            fields = mapOf(
+                "uuid" to uuid,
+                "name" to device.name.orEmpty(),
+                "rssi" to device.rssi,
+                "emitted" to emitted,
+            ),
         )
     }
 }

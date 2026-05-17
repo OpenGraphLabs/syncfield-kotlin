@@ -8,6 +8,9 @@ import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.log.LogLv
 import com.arashivision.sdkcamera.log.LogManager
 import com.clj.fastble.data.BleDevice
+import com.clj.fastble.utils.BleLog
+import io.opengraph.syncfield.insta360.logging.InstaLog
+import io.opengraph.syncfield.insta360.logging.InstaLogCategory
 import java.io.File
 
 /**
@@ -33,7 +36,15 @@ internal object Insta360OneSDKBridge {
     private val initLock = Any()
     @Volatile private var initialized = false
 
-    fun setup(context: Context) {
+    /**
+     * Initialize the Insta360 SDK exactly once. `initCameraSupportConfig` is
+     * deliberately NOT called here — it requires an already-connected camera
+     * (the SDK uses it to download per-device capability JSON), so calling
+     * it before BLE scan logs `BaseCamera is empty, the camera may have been
+     * disconnected`. Discovery uses the native [Insta360NativeBleScanner]
+     * which doesn't depend on per-device support config.
+     */
+    suspend fun setup(context: Context) {
         if (!available) throw Insta360Error.FrameworkNotLinked
         if (initialized) return
         synchronized(initLock) {
@@ -42,11 +53,26 @@ internal object Insta360OneSDKBridge {
                 ?: throw Insta360Error.CommandFailed(
                     "InstaCameraSDK.init requires an Application context")
             InstaCameraSDK.init(app)
-            val logDir = File(app.filesDir, "insta360_logs").apply { mkdirs() }
+            // `Insta360SupportConfigWrapper` was installed here while we
+            // were attempting to make the SDK's high-level `connectBle()`
+            // accept GO 3S. That path is now bypassed entirely (we drive
+            // GATT via fastble in [Insta360GattHandshake]), so the wrapper
+            // is no longer wired. Kept in the source tree for reference.
+            val externalRoot = app.getExternalFilesDir(null) ?: app.filesDir
+            val logDir = File(externalRoot, "insta360_logs").apply { mkdirs() }
             LogManager.instance.logRootPath = logDir.absolutePath
-            LogManager.instance.setLogCacheLevel(LogLv.WARN)
-            LogManager.instance.setLogPrintLevel(LogLv.WARN)
+            // VERBOSE while the protocol handshake is still in bring-up.
+            // Revert to INFO once first-pair + identify + record work
+            // end-to-end on a real GO 3S.
+            LogManager.instance.setLogCacheLevel(LogLv.VERBOSE)
+            LogManager.instance.setLogPrintLevel(LogLv.VERBOSE)
+            BleLog.enableLog(true)
+            android.util.Log.i(
+                "INSTA360_BRIDGE",
+                "sdk_file_log_root path=${logDir.absolutePath}",
+            )
             initialized = true
+            InstaLog.log(InstaLogCategory.BRIDGE, event = "sdk_init_complete")
         }
     }
 
