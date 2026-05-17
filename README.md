@@ -6,11 +6,15 @@ IMU, FSR gloves, and Insta360 cameras share a single host clock and
 produce a common on-disk layout that the syncfield Python pipeline
 ingests.
 
-> **Status — v0.4.0 Android app readiness release.** The build is green,
-> the JVM-side orchestration logic is unit-tested, and the Android SDK is
-> published from the `v0.4.0` GitHub tag for host apps that do not want a
-> sibling composite build. Insta360 SDK calls are still gated by runtime
-> OneSDK availability — see [Insta360 module](#insta360-module).
+> **Status — v0.5.0-preview.** The Insta360 module reaches feature parity
+> with `syncfield-swift` v0.9.x (per-camera supervisor, radio gate,
+> connection coordinator, multi-camera collector, identity store,
+> background lifecycle). 135 unit tests, 0 failures.
+>
+> Pairing reliability on Android is still being stabilized vs. iOS, so
+> this preview is intended for **integration / interface review**, not
+> production use. A stable `v0.5.0` will follow once the BLE pair /
+> reconnect path is fully tuned.
 
 ## Modules
 
@@ -35,19 +39,45 @@ ingests.
 
 ## Insta360 module
 
-`syncfield-insta360` integrates with Insta360's official `INSCameraSDK`
-Android AAR. The AAR is not on Maven Central — host apps drop
-`OneSDK.aar` into their own `app/libs/` and add the corresponding
-`flatDir` repository. While the AAR is absent, every Insta360 call
-throws `Insta360Error.FrameworkNotLinked` and the rest of the SDK
-stays usable; this matches the iOS behaviour where
-`canImport(INSCameraServiceSDK)` gates production paths.
+`syncfield-insta360` integrates directly with Insta360's official
+`com.arashivision.sdk:sdkcamera` (OneSDK 1.10.1) — no reflection
+scaffolds. OneSDK is pulled transitively from Insta360's own Maven
+repository, so the host app needs that repository registered in its
+`settings.gradle.kts` alongside the standard ones:
 
-The current `Insta360BLEController` is a **scaffold** — its `pair`,
-`startRemoteRecording`, `stopRemoteRecording`, and `wifiCredentials`
-methods are structured to mirror the iOS implementation but invoke the
-SDK reflectively through `Insta360OneSDKBridge`. Filling in the actual
-OneSDK calls is a follow-up tracked in the v0.3.1 milestone.
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven("https://jitpack.io")
+        maven("https://androidsdk.insta360.com/repository/maven-public/") {
+            credentials {
+                username = "insta360guest"
+                password = "EXMSjSo8OeOrjU7d"
+            }
+        }
+    }
+}
+```
+
+The public Insta360 API exposed by this module covers:
+
+- **`Insta360BLEController`** — per-camera BLE control (pair, start /
+  stop remote recording, Wi-Fi credentials, heartbeat, phone auth)
+- **`Insta360ConnectionCoordinator`** + **`Insta360CameraSupervisor`** —
+  process-wide state machine, reconnect backoff, wake-stall surfacing
+- **`Insta360RadioGate`** — Wi-Fi serialization across cameras
+- **`Insta360Collector`** — multi-camera batch downloader with
+  prefetch-pair-then-sequential semantics
+- **`Insta360BackgroundSupervisor`** — `ProcessLifecycleOwner`
+  integration for background / foreground transitions
+- **`Insta360IdentityStore`** — JSON-backed phone-authorization +
+  last-known UUID cache, wire-compatible with iOS
+
+`Insta360Support.available` is kept as a `Class.forName` capability
+flag so R8 / ProGuard configurations that strip the OneSDK still
+fail-fast cleanly.
 
 ## Building
 
@@ -106,13 +136,16 @@ Then depend on the modules the host app needs:
 
 ```kotlin
 dependencies {
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-core:v0.4.0")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-streams:v0.4.0")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-tactile:v0.4.0")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-insta360:v0.4.0")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-ui:v0.4.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-core:v0.5.0-preview")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-streams:v0.5.0-preview")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-tactile:v0.5.0-preview")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-insta360:v0.5.0-preview")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-ui:v0.5.0-preview")
 }
 ```
+
+The previous stable line is available at `v0.4.0` (Insta360 pairing
+only, no supervisor stack).
 
 ## Using as a composite build
 
@@ -126,11 +159,11 @@ includeBuild('../path/to/syncfield-kotlin')
 ```kotlin
 // app/build.gradle (host app)
 dependencies {
-    implementation("io.opengraph.syncfield:syncfield-core:0.4.0")
-    implementation("io.opengraph.syncfield:syncfield-streams:0.4.0")
-    implementation("io.opengraph.syncfield:syncfield-tactile:0.4.0")
-    implementation("io.opengraph.syncfield:syncfield-insta360:0.4.0")
-    implementation("io.opengraph.syncfield:syncfield-ui:0.4.0")
+    implementation("io.opengraph.syncfield:syncfield-core:0.5.0")
+    implementation("io.opengraph.syncfield:syncfield-streams:0.5.0")
+    implementation("io.opengraph.syncfield:syncfield-tactile:0.5.0")
+    implementation("io.opengraph.syncfield:syncfield-insta360:0.5.0")
+    implementation("io.opengraph.syncfield:syncfield-ui:0.5.0")
 }
 ```
 
