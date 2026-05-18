@@ -38,6 +38,11 @@ internal data class Insta360ResolvedWifiCredentials(
     val passwordSource: String,
 )
 
+private data class CachedInsta360WifiCredentials(
+    val deviceKey: String,
+    val credentials: Insta360ResolvedWifiCredentials,
+)
+
 internal const val INSTA360_DEFAULT_WIFI_PASSWORD = "88888888"
 
 internal fun deriveInsta360Ssid(deviceName: String?, stableId: String?): String {
@@ -52,11 +57,18 @@ internal fun resolveInsta360WifiCredentials(
     stableId: String?,
     sdkSsid: String?,
     sdkPassword: String?,
+    preferSdkSsid: Boolean = false,
 ): Insta360ResolvedWifiCredentials {
     val derivedSsid = deriveInsta360Ssid(deviceName, stableId).takeIf { it.isNotBlank() }
     val normalizedSdkSsid = sdkSsid.normalizedSsidOrNull()
-    val ssid = derivedSsid ?: normalizedSdkSsid ?: ""
+    val ssid = when {
+        preferSdkSsid && normalizedSdkSsid != null -> normalizedSdkSsid
+        derivedSsid != null -> derivedSsid
+        normalizedSdkSsid != null -> normalizedSdkSsid
+        else -> ""
+    }
     val ssidSource = when {
+        preferSdkSsid && normalizedSdkSsid != null -> "sdk"
         derivedSsid != null -> "derived"
         normalizedSdkSsid != null -> "sdk"
         else -> "missing"
@@ -180,6 +192,13 @@ class Insta360BLEController(
         private set
 
     /**
+     * Snapshot of the camera AP credentials captured while the BLE command
+     * channel is freshly paired. iOS keeps the same cache so ingest can avoid
+     * querying options during the radio handoff to the camera AP.
+     */
+    @Volatile private var cachedWifiCredentials: CachedInsta360WifiCredentials? = null
+
+    /**
      * Listener for unsolicited BLE disconnects. Registered eagerly so we can
      * observe drops even when no in-flight command is running. Kept as a
      * field so [unpair] can deregister cleanly.
@@ -205,6 +224,7 @@ class Insta360BLEController(
             setConnectedIdentity(device)
             registerDisconnectListener()
         }
+        prefetchWifiCredentials(device)
         startHeartbeat()
         InstaLog.log(
             InstaLogCategory.BLE,
@@ -324,13 +344,10 @@ class Insta360BLEController(
             retries = 0,
             sdkCritical = false,
         ) {
-            val stableId = Insta360OneSDKBridge.stableId(device)
-            val wifi = runCatching { manager.wifiInfo }.getOrNull()
-            val resolved = resolveInsta360WifiCredentials(
-                deviceName = device.name,
-                stableId = stableId,
-                sdkSsid = wifi?.ssid,
-                sdkPassword = wifi?.pwd,
+            val resolved = resolveWifiCredentialsForDevice(
+                device = device,
+                fetchOptions = false,
+                preferCached = true,
             )
             val ssid = resolved.ssid
             if (ssid.isBlank()) throw Insta360Error.WifiCredentialsUnavailable
@@ -341,12 +358,119 @@ class Insta360BLEController(
                     "ssid" to ssid,
                     "ssid_source" to resolved.ssidSource,
                     "password_source" to resolved.passwordSource,
+                    "cached" to cachedWifiCredentialsMatches(device, resolved),
                     "preserved_session" to true,
                 ),
             )
             ssid to resolved.password
         }
     }
+
+    private suspend fun prefetchWifiCredentials(device: BleDevice) {
+        commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 5_000L,
+            retries = 0,
+            sdkCritical = false,
+        ) {
+            runCatching {
+                resolveWifiCredentialsForDevice(
+                    device = device,
+                    fetchOptions = true,
+                    preferCached = false,
+                )
+            }.onSuccess { resolved ->
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    event = "wifi_credentials_prefetch_ok",
+                    fields = mapOf(
+                        "ssid" to resolved.ssid,
+                        "ssid_source" to resolved.ssidSource,
+                        "password_source" to resolved.passwordSource,
+                    ),
+                )
+            }.onFailure { error ->
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    level = InstaLogLevel.WARN,
+                    event = "wifi_credentials_prefetch_failed",
+                    fields = mapOf("error" to (error.message ?: error::class.java.simpleName)),
+                )
+            }
+        }
+    }
+
+    private suspend fun resolveWifiCredentialsForDevice(
+        device: BleDevice,
+        fetchOptions: Boolean,
+        preferCached: Boolean,
+    ): Insta360ResolvedWifiCredentials {
+        if (preferCached) {
+            cachedWifiCredentialsFor(device)?.let { cached ->
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    event = "wifi_credentials_cache_hit",
+                    fields = mapOf(
+                        "ssid" to cached.ssid,
+                        "ssid_source" to cached.ssidSource,
+                        "password_source" to cached.passwordSource,
+                    ),
+                )
+                return cached
+            }
+        }
+
+        var fetchedOptions = false
+        if (fetchOptions) {
+            runCatching { fetchCameraOptions(timeoutMs = 3_000L) }
+                .onSuccess {
+                    fetchedOptions = true
+                    InstaLog.log(InstaLogCategory.BLE, event = "wifi_credentials_options_prefetch_ok")
+                }
+                .onFailure { error ->
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "wifi_credentials_options_prefetch_failed",
+                        fields = mapOf("error" to (error.message ?: error::class.java.simpleName)),
+                    )
+                }
+        }
+
+        val stableId = Insta360OneSDKBridge.stableId(device)
+        val wifi = runCatching { manager.wifiInfo }.getOrNull()
+        val resolved = resolveInsta360WifiCredentials(
+            deviceName = device.name,
+            stableId = stableId,
+            sdkSsid = wifi?.ssid,
+            sdkPassword = wifi?.pwd,
+            preferSdkSsid = fetchedOptions,
+        )
+        if (resolved.ssid.isNotBlank()) {
+            cachedWifiCredentials = CachedInsta360WifiCredentials(
+                deviceKey = wifiCredentialCacheKey(device),
+                credentials = resolved,
+            )
+        }
+        return resolved
+    }
+
+    private fun cachedWifiCredentialsFor(device: BleDevice): Insta360ResolvedWifiCredentials? {
+        return cachedWifiCredentials?.takeIf { cached ->
+            cached.deviceKey.isNotBlank() && cached.deviceKey == wifiCredentialCacheKey(device)
+        }?.credentials
+    }
+
+    private fun cachedWifiCredentialsMatches(
+        device: BleDevice,
+        credentials: Insta360ResolvedWifiCredentials,
+    ): Boolean = cachedWifiCredentialsFor(device)?.ssid == credentials.ssid
+
+    private fun wifiCredentialCacheKey(device: BleDevice): String =
+        Insta360OneSDKBridge.stableId(device)
+            .normalizedSsidOrNull()
+            ?: device.name.normalizedSsidOrNull()
+            ?: ""
 
     /**
      * Bring up the camera's Wi-Fi AP before Android asks the OS to join the
@@ -852,7 +976,7 @@ class Insta360BLEController(
         }
     }
 
-    private suspend fun fetchCameraOptions() {
+    private suspend fun fetchCameraOptions(timeoutMs: Long = 10_000L) {
         val done = CompletableDeferred<Unit>()
         manager.fetchCameraOptions(object : ICameraOperateCallback {
             override fun onSuccessful() {
@@ -871,7 +995,7 @@ class Insta360BLEController(
                 }
             }
         })
-        withTimeout(10_000) { done.await() }
+        withTimeout(timeoutMs) { done.await() }
     }
 
     private suspend fun ensureNormalRecordMode() {

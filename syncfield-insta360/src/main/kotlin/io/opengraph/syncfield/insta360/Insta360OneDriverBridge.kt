@@ -421,11 +421,31 @@ internal class Insta360OneDriverBridge private constructor(
     suspend fun enableWifiForDownload(timeoutMs: Long = 10_000L) {
         if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
         val setOptionsState = setWifiStatusOn(timeoutMs)
-        if (setOptionsState == WifiEnableState.Confirmed || setOptionsState == WifiEnableState.Sent) {
-            delay(WIFI_AP_SETTLE_DELAY_MS)
-            return
+        val plan = wifiEnablePlanAfterSetOptions(setOptionsState)
+        InstaLog.log(
+            InstaLogCategory.BLE,
+            event = "onedriver_wifi_enable_plan",
+            fields = mapOf(
+                "set_options_state" to setOptionsState.name,
+                "open_camera_wifi" to plan.openCameraWifi,
+                "require_open_success" to plan.requireOpenCameraWifiSuccess,
+            ),
+        )
+        if (plan.openCameraWifi) {
+            val openResult = runCatching { openCameraWifiHint(timeoutMs = 8_000L) }
+            openResult.onFailure { error ->
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    level = InstaLogLevel.WARN,
+                    event = "onedriver_open_camera_wifi_failed",
+                    fields = mapOf(
+                        "set_options_state" to setOptionsState.name,
+                        "error" to (error.message ?: error::class.java.simpleName),
+                    ),
+                )
+                if (plan.requireOpenCameraWifiSuccess) throw error
+            }
         }
-        openCameraWifiHint(timeoutMs = 6_000L)
         delay(WIFI_AP_SETTLE_DELAY_MS)
     }
 
@@ -586,11 +606,22 @@ internal class Insta360OneDriverBridge private constructor(
     }
 }
 
-private enum class WifiEnableState {
+internal enum class WifiEnableState {
     NotSent,
     Sent,
     Confirmed,
 }
+
+internal data class WifiEnablePlan(
+    val openCameraWifi: Boolean,
+    val requireOpenCameraWifiSuccess: Boolean,
+)
+
+internal fun wifiEnablePlanAfterSetOptions(state: WifiEnableState): WifiEnablePlan =
+    WifiEnablePlan(
+        openCameraWifi = true,
+        requireOpenCameraWifiSuccess = state == WifiEnableState.NotSent,
+    )
 
 internal object Insta360RecordState {
     private const val STARTED = 0

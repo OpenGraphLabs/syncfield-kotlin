@@ -6,6 +6,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.SystemClock
@@ -261,6 +262,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
             }
             override fun onUnavailable() {
+                logWifiScanSnapshot(ssid = ssid, phase = "on_unavailable", attempt = attempt)
                 InstaLog.log(
                     InstaLogCategory.WIFI,
                     level = InstaLogLevel.WARN,
@@ -283,6 +285,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                 "timeout_ms" to timeoutMs,
             ),
         )
+        logWifiScanSnapshot(ssid = ssid, phase = "before_request", attempt = attempt)
         cm.requestNetwork(request, cb, timeoutMs.toInt())
         try {
             withTimeoutOrNull(
@@ -300,6 +303,57 @@ class Insta360WiFiDownloader(private val context: Context) {
             throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown")
         }
         return cb
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun logWifiScanSnapshot(ssid: String, phase: String, attempt: Int) {
+        val wifiManager = context.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return
+        val results = runCatching {
+            wifiManager.scanResults
+                .asSequence()
+                .mapNotNull { result ->
+                    val resultSsid = result.SSID?.trim().orEmpty()
+                    if (resultSsid.isBlank()) return@mapNotNull null
+                    if (
+                        resultSsid == ssid ||
+                        resultSsid.contains("GO 3S", ignoreCase = true) ||
+                        resultSsid.endsWith(".OSC", ignoreCase = true)
+                    ) {
+                        "${resultSsid}@${result.level}"
+                    } else {
+                        null
+                    }
+                }
+                .distinct()
+                .take(8)
+                .toList()
+        }.getOrElse { error ->
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "wifi_scan_snapshot_failed",
+                fields = mapOf(
+                    "ssid" to ssid,
+                    "phase" to phase,
+                    "attempt" to attempt,
+                    "error" to (error.message ?: error::class.java.simpleName),
+                ),
+            )
+            return
+        }
+        InstaLog.log(
+            InstaLogCategory.WIFI,
+            event = "wifi_scan_snapshot",
+            fields = mapOf(
+                "ssid" to ssid,
+                "phase" to phase,
+                "attempt" to attempt,
+                "visible_target" to results.any { it.startsWith("$ssid@") },
+                "matches" to results,
+            ),
+        )
     }
 
     private suspend fun waitForReachability(cm: ConnectivityManager) {

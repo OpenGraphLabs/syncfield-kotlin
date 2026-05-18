@@ -36,6 +36,22 @@ class Insta360WifiCredentialsTest {
     }
 
     @Test
+    fun resolveWifiCredentials_prefersFreshSdkSsidWhenRequested() {
+        val resolved = resolveInsta360WifiCredentials(
+            deviceName = "GO 3S 1TEBJJ",
+            stableId = "GO 3S 1TEBJJDE:6C:62:7B:3C:0E",
+            sdkSsid = "Insta360-GO3S-actual.OSC",
+            sdkPassword = "camera-password",
+            preferSdkSsid = true,
+        )
+
+        assertThat(resolved.ssid).isEqualTo("Insta360-GO3S-actual.OSC")
+        assertThat(resolved.password).isEqualTo("camera-password")
+        assertThat(resolved.ssidSource).isEqualTo("sdk")
+        assertThat(resolved.passwordSource).isEqualTo("sdk")
+    }
+
+    @Test
     fun resolveWifiCredentials_stripsAndroidQuotedSsid() {
         val resolved = resolveInsta360WifiCredentials(
             deviceName = null,
