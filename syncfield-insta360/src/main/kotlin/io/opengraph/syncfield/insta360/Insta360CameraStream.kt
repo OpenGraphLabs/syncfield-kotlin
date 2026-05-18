@@ -9,6 +9,9 @@ import io.opengraph.syncfield.StreamConnectContext
 import io.opengraph.syncfield.StreamIngestReport
 import io.opengraph.syncfield.StreamStopReport
 import io.opengraph.syncfield.SyncFieldStream
+import io.opengraph.syncfield.insta360.logging.InstaLog
+import io.opengraph.syncfield.insta360.logging.InstaLogCategory
+import io.opengraph.syncfield.insta360.logging.InstaLogLevel
 import io.opengraph.syncfield.writers.WriterFactory
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -123,6 +126,18 @@ class Insta360CameraStream(
             "no camera file uri recorded from stopRecording")
 
         val (ssid, passphrase) = ble.wifiCredentials()
+        runCatching { ble.enableWiFiForDownload() }
+            .onFailure { t ->
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    level = InstaLogLevel.WARN,
+                    event = "stream_wifi_enable_for_download_failed_continue",
+                    fields = mapOf(
+                        "stream_id" to streamId,
+                        "error" to (t.message ?: t::class.java.simpleName),
+                    ),
+                )
+            }
         val destination = File(episodeDirectory, "$streamId.mp4")
         val sidecar = Insta360PendingSidecar.scan(episodeDirectory)
             .firstOrNull { it.streamId == streamId }

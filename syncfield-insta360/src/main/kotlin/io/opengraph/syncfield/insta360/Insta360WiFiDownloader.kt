@@ -11,6 +11,9 @@ import android.os.Build
 import androidx.annotation.RequiresApi
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.camera.callback.ICameraOperateCallback
+import io.opengraph.syncfield.insta360.logging.InstaLog
+import io.opengraph.syncfield.insta360.logging.InstaLogCategory
+import io.opengraph.syncfield.insta360.logging.InstaLogLevel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -22,6 +25,9 @@ import java.time.Instant
 import java.time.format.DateTimeFormatter
 
 internal object Insta360WiFiReachabilityPolicy {
+    const val joinTimeoutMs: Long = 45_000L
+    const val joinAwaitSlackMs: Long = 2_000L
+
     val probeDelaysMs: List<Long> = listOf(
         1_000L,
         1_000L,
@@ -185,22 +191,49 @@ class Insta360WiFiDownloader(private val context: Context) {
             override fun onAvailable(network: Network) {
                 cm.bindProcessToNetwork(network)
                 runCatching { Insta360OneSDKBridge.bindNetwork(network) }
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    event = "camera_ap_join_available",
+                    fields = mapOf(
+                        "ssid" to ssid,
+                        "network" to network.networkHandle,
+                    ),
+                )
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
             }
             override fun onUnavailable() {
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    level = InstaLogLevel.WARN,
+                    event = "camera_ap_join_unavailable",
+                    fields = mapOf("ssid" to ssid),
+                )
                 if (!onAvailable.isCompleted) {
                     onAvailable.completeExceptionally(
-                        Insta360Error.HotspotApplyFailed("system rejected SSID=$ssid")
+                        Insta360Error.HotspotApplyFailed("camera AP unavailable for SSID=$ssid")
                     )
                 }
             }
         }
-        cm.requestNetwork(request, cb)
+        InstaLog.log(
+            InstaLogCategory.WIFI,
+            event = "camera_ap_join_requested",
+            fields = mapOf(
+                "ssid" to ssid,
+                "timeout_ms" to Insta360WiFiReachabilityPolicy.joinTimeoutMs,
+            ),
+        )
+        cm.requestNetwork(request, cb, Insta360WiFiReachabilityPolicy.joinTimeoutMs.toInt())
         try {
-            withTimeoutOrNull(20_000) { onAvailable.await() }
-                ?: throw Insta360Error.HotspotApplyFailed("camera AP join timeout (20s)")
+            withTimeoutOrNull(
+                Insta360WiFiReachabilityPolicy.joinTimeoutMs +
+                    Insta360WiFiReachabilityPolicy.joinAwaitSlackMs,
+            ) { onAvailable.await() }
+                ?: throw Insta360Error.HotspotApplyFailed(
+                    "camera AP join timeout (${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms)")
         } catch (t: TimeoutCancellationException) {
-            throw Insta360Error.HotspotApplyFailed("camera AP join timeout (20s)")
+            throw Insta360Error.HotspotApplyFailed(
+                "camera AP join timeout (${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms)")
         } catch (t: Throwable) {
             if (t is Insta360Error) throw t
             throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown")

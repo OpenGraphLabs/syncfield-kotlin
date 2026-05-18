@@ -7,6 +7,7 @@ import com.arashivision.camera.RequestOptions
 import com.arashivision.onecamera.OneDriver
 import com.arashivision.onecamera.OneDriverInfo
 import com.arashivision.onecamera.camerarequest.TakePicture
+import com.arashivision.onecamera.cameraresponse.OpenCameraWifiResp
 import com.arashivision.onecamera.cameraresponse.StreamData
 import com.arashivision.onecamera.cameraresponse.TakePictureResponse
 import com.arashivision.onecamera.cameraresponse.TakePictureWithoutStorageResponse
@@ -402,6 +403,66 @@ internal class Insta360OneDriverBridge private constructor(
             oneDriver.captureStillImage(tp)
             InstaLog.log(InstaLogCategory.BLE, event = "onedriver_capture_still_image_sent")
             return withTimeout(timeoutMs) { ack.await() }
+        } finally {
+            collector.cancel()
+        }
+    }
+
+    /**
+     * Ask the camera to bring up its own Wi-Fi AP before Android requests
+     * the `GO 3S ... .OSC` network. This mirrors iOS'
+     * `enableWiFiForDownload`; without this preflight Android races the
+     * system network request against an AP that is not yet advertising and
+     * `ConnectivityManager` reports `onUnavailable`.
+     */
+    suspend fun enableWifiForDownload(timeoutMs: Long = 8_000L) {
+        if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
+        val ack = CompletableDeferred<Int>()
+        val collector = bridgeScope.launch {
+            infoNotifications
+                .filter {
+                    it.what == OneDriverInfo.Response.InfoType.OPEN_CAMERA_WIFI ||
+                        it.what == OneDriverInfo.Response.InfoType.CAM_WIFI_START
+                }
+                .collect { event ->
+                    val responseCode = (event.obj as? OpenCameraWifiResp)?.errorCode
+                    val code = responseCode ?: event.err
+                    if (!ack.isCompleted) ack.complete(code)
+                }
+        }
+        try {
+            val requestId = oneDriver.openCameraWifi(0)
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "onedriver_open_camera_wifi_sent",
+                fields = mapOf("requestId" to requestId, "mode" to 0),
+            )
+            if (requestId < 0) {
+                throw Insta360Error.CommandFailed("open camera wifi returned requestId=$requestId")
+            }
+            val code = withTimeoutOrNull(timeoutMs) { ack.await() }
+            when {
+                code == null -> {
+                    // Some firmware turns the AP on but does not deliver the
+                    // response frame over BLE. Treat this as Swift does: a
+                    // latency hint, not a hard precondition.
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "onedriver_open_camera_wifi_timeout_continue",
+                        fields = mapOf("timeout_ms" to timeoutMs),
+                    )
+                }
+                code == 0 -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        event = "onedriver_open_camera_wifi_ok",
+                    )
+                }
+                else -> {
+                    throw Insta360Error.CommandFailed("open camera wifi failed code=$code")
+                }
+            }
         } finally {
             collector.cancel()
         }

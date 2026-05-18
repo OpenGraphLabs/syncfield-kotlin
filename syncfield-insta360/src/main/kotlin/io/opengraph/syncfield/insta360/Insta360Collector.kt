@@ -118,6 +118,7 @@ object Insta360Collector {
     ): List<Insta360FileInfo> {
         val controller = Insta360BluetoothHub.pair(context, uuid)
         val (ssid, passphrase) = controller.wifiCredentials()
+        enableCameraWifiForDownload(controller, uuid)
         return Insta360ConnectionCoordinator.withWiFi(uuid) {
             Insta360WiFiDownloader(context).listFiles(ssid, passphrase)
         }
@@ -261,6 +262,7 @@ object Insta360Collector {
                     continue
                 }
                 val (ssid, passphrase) = credsResult.getOrThrow()
+                enableCameraWifiForDownload(controller, uuid)
 
                 for (p in list) {
                     progress(Progress(p.episodeDir, p.sidecar.streamId, uuid, p.sidecar.role, "pairing", 0.0, ssid = ssid))
@@ -351,6 +353,31 @@ object Insta360Collector {
             ),
         )
         return results
+    }
+
+    private suspend fun enableCameraWifiForDownload(
+        controller: Insta360BLEController,
+        uuid: String,
+    ) {
+        runCatching { controller.enableWiFiForDownload() }
+            .onSuccess {
+                InstaLog.log(
+                    InstaLogCategory.COLLECT,
+                    event = "wifi_enable_for_download_ok",
+                    fields = mapOf("uuid" to uuid),
+                )
+            }
+            .onFailure { t ->
+                InstaLog.log(
+                    InstaLogCategory.COLLECT,
+                    level = InstaLogLevel.WARN,
+                    event = "wifi_enable_for_download_failed_continue",
+                    fields = mapOf(
+                        "uuid" to uuid,
+                        "error" to (t.message ?: t::class.java.simpleName),
+                    ),
+                )
+            }
     }
 
     /** Test-only — clears active-job state. */

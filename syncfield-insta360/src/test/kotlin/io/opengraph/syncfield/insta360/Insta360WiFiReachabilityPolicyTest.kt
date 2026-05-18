@@ -11,4 +11,10 @@ class Insta360WiFiReachabilityPolicyTest {
             .containsExactly(1_000L, 1_000L, 1_500L, 2_000L, 2_500L, 3_000L, 4_000L, 5_000L)
             .inOrder()
     }
+
+    @Test
+    fun `camera ap join timeout allows android approval and ap boot window`() {
+        assertThat(Insta360WiFiReachabilityPolicy.joinTimeoutMs).isAtLeast(45_000L)
+        assertThat(Insta360WiFiReachabilityPolicy.joinAwaitSlackMs).isAtLeast(1_000L)
+    }
 }

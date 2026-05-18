@@ -283,6 +283,29 @@ class Insta360BLEController(
     }
 
     /**
+     * Bring up the camera's Wi-Fi AP before Android asks the OS to join the
+     * `*.OSC` network. BLE still owns the control plane here; the actual
+     * phone Wi-Fi join/download happens later in [Insta360WiFiDownloader].
+     */
+    suspend fun enableWiFiForDownload() {
+        setup()
+        val device = requireDevice()
+        commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 15_000L,
+            retries = 1,
+            sdkCritical = false,
+        ) {
+            if (oneDriverBridge == null || protocolSession == null) {
+                connectDeviceWithRetry(device)
+            }
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            bridge.enableWifiForDownload()
+        }
+    }
+
+    /**
      * Trigger a still-image capture on the camera (identify-photo).
      * Routed through [Insta360OneDriverBridge.captureStillImage] which
      * writes the SDK's native shutter command on our protocol session —
