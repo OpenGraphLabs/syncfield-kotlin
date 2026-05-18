@@ -1,6 +1,7 @@
 package io.opengraph.syncfield.ui
 
 import android.content.Context
+import android.graphics.Color
 import android.util.AttributeSet
 import android.util.Log
 import android.view.Surface
@@ -38,7 +39,7 @@ class SyncFieldPreviewView @JvmOverloads constructor(
 
     private val previewView = PreviewView(context).apply {
         layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
-        scaleType = PreviewView.ScaleType.FILL_CENTER
+        scaleType = PreviewView.ScaleType.FIT_CENTER
         // TextureView-backed preview handles React Native overlays and
         // runtime orientation changes more predictably than SurfaceView.
         // VideoCapture and ImageAnalysis stay bound as separate CameraX
@@ -57,6 +58,14 @@ class SyncFieldPreviewView @JvmOverloads constructor(
     private var boundStream: AndroidCameraStream? = null
 
     init {
+        // The FrameLayout itself must paint opaque black: the underlying
+        // TextureView (PreviewView) is transparent until the camera
+        // produces its first frame, and during native-stack screen
+        // transitions on Android that gap lets the previous screen
+        // bleed through behind the camera preview. iOS gets this for
+        // free because `AVCaptureVideoPreviewLayer`'s backing CALayer
+        // is opaque black by default.
+        setBackgroundColor(Color.BLACK)
         addView(previewView)
     }
 
@@ -121,10 +130,9 @@ class SyncFieldPreviewView @JvmOverloads constructor(
             return
         }
 
-        val live = stream.livePreview ?: run {
-            // The bridge normally publishes only after connect(), but keep
-            // this view tolerant of early manual binding. Retrying preserves
-            // the collector instead of cancelling it on an exception.
+        if (stream.livePreview == null) {
+            // configureUseCases() hasn't run yet — retry once the
+            // stream is fully connected.
             postDelayed({
                 if (isAttachedToWindow && boundStream !== stream) bindInternal(stream)
             }, 50L)
@@ -132,7 +140,13 @@ class SyncFieldPreviewView @JvmOverloads constructor(
         }
         updateScaleTypeForBounds(width, height)
         stream.setTargetRotation(currentTargetRotation())
-        live.setSurfaceProvider(previewView.surfaceProvider)
+        // Hand the surface to the stream; the stream performs the
+        // initial bindToLifecycle internally so the CameraX session
+        // boots with the surface attached (instead of binding
+        // surface-less and missing the first frames — the bug that
+        // showed up on Galaxy S-class devices as "preview is black
+        // until the first rotation").
+        stream.attachPreviewSurfaceProvider(previewView.surfaceProvider)
         boundStream = stream
         Log.i(
             TAG,
@@ -148,17 +162,17 @@ class SyncFieldPreviewView @JvmOverloads constructor(
         return if (width > height) Surface.ROTATION_90 else Surface.ROTATION_0
     }
 
-    /** Set the [PreviewView] scale type. Default is [PreviewView.ScaleType.FILL_CENTER]. */
+    /** Set the [PreviewView] scale type. Default is [PreviewView.ScaleType.FIT_CENTER]. */
     fun setScaleType(type: PreviewView.ScaleType) {
         previewView.scaleType = type
     }
 
     private fun updateScaleTypeForBounds(w: Int, h: Int) {
         if (w <= 0 || h <= 0) return
-        // The recording view is a camera-first surface. It should always fill
-        // the phone, including landscape. FIT_CENTER preserves every camera
-        // pixel but creates a small, letterboxed preview on 19.5:9 phones.
-        previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+        // Preserve the whole camera frame. In landscape, FILL_CENTER crops a
+        // 16:9 camera stream on tall phone displays and reads as a digital
+        // zoom. FIT_CENTER keeps the ultra-wide field of view visible.
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
     }
 
     private companion object {

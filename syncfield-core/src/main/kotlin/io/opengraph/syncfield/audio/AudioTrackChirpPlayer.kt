@@ -10,10 +10,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * Android default chirp player. Synthesises the waveform with
- * [ChirpSynthesis], hands it to an [AudioTrack] in MODE_STATIC, and
+ * [ChirpSynthesis], streams it through an [AudioTrack], and
  * captures the head position in nanoseconds via [AudioTrack.getTimestamp]
  * once playback has actually started.
  *
@@ -45,7 +47,13 @@ class AudioTrackChirpPlayer(
             return@withContext softwareFallback()
         }
 
-        val sizeBytes = samples.size * Float.SIZE_BYTES
+        val pcm16 = samples.toPcm16()
+        val sizeBytes = pcm16.size * Short.SIZE_BYTES
+        val minBufferBytes = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        ).takeIf { it > 0 } ?: sizeBytes
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -55,13 +63,13 @@ class AudioTrackChirpPlayer(
             )
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(sampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(sizeBytes)
-            .setTransferMode(AudioTrack.MODE_STATIC)
+            .setBufferSizeInBytes(max(sizeBytes, minBufferBytes))
+            .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
         if (track.state != AudioTrack.STATE_INITIALIZED) {
@@ -69,14 +77,13 @@ class AudioTrackChirpPlayer(
             return@withContext softwareFallback()
         }
 
-        val written = track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-        if (written < 0) {
+        runCatching { track.setVolume(AudioTrack.getMaxVolume()) }
+        val softwareStart = System.nanoTime()
+        track.play()
+        if (!track.writeAll(pcm16)) {
             track.release()
             return@withContext softwareFallback()
         }
-
-        val softwareStart = System.nanoTime()
-        track.play()
 
         // Brief wait so the first sample has a chance to land in the
         // mixer before we sample the hardware clock.
@@ -111,3 +118,25 @@ class AudioTrackChirpPlayer(
         }
     }
 }
+
+private fun AudioTrack.writeAll(samples: ShortArray): Boolean {
+    var offset = 0
+    while (offset < samples.size) {
+        val written = write(samples, offset, samples.size - offset, AudioTrack.WRITE_BLOCKING)
+        if (written <= 0) return false
+        offset += written
+    }
+    return true
+}
+
+internal fun FloatArray.toPcm16(): ShortArray =
+    ShortArray(size) { index ->
+        val sample = this[index].coerceIn(-1f, 1f)
+        val scaled = when {
+            sample <= -1f -> Short.MIN_VALUE.toInt()
+            sample >= 1f -> Short.MAX_VALUE.toInt()
+            sample < 0f -> (sample * -Short.MIN_VALUE).roundToInt()
+            else -> (sample * Short.MAX_VALUE).roundToInt()
+        }
+        scaled.toShort()
+    }

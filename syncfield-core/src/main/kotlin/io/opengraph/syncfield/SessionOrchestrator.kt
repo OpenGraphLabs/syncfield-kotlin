@@ -126,7 +126,12 @@ class SessionOrchestrator(
         state = SessionState.Connected
     }
 
-    suspend fun startRecording(countdownMs: Long = 0L): SyncPoint {
+    suspend fun startRecording(
+        countdownMs: Long = 0L,
+        countdownSeconds: Int = 0,
+        countdownIntervalMs: Long = 1_000L,
+        onCountdownTick: suspend (Int) -> Unit = {},
+    ): SyncPoint {
         val anchor = mutex.withLock {
             requireState(SessionState.Connected, SessionState.Recording)
 
@@ -180,6 +185,13 @@ class SessionOrchestrator(
 
             state = SessionState.Recording
             a
+        }
+
+        if (countdownSeconds > 0) {
+            for (remaining in countdownSeconds downTo 1) {
+                onCountdownTick(remaining)
+                if (countdownIntervalMs > 0) delay(countdownIntervalMs)
+            }
         }
 
         // Chirp emission happens outside the mutex so the player's
@@ -314,6 +326,26 @@ class SessionOrchestrator(
         IngestReport(results)
     }
 
+    /**
+     * Close a stopped episode without running stream ingest.
+     *
+     * Host apps that defer collection/upload still need the session to
+     * return to Connected after stop; otherwise the next recording attempt
+     * starts from Stopping and fails its state transition.
+     */
+    suspend fun finishRecording() = mutex.withLock {
+        if (state == SessionState.Connected) return@withLock
+        requireState(SessionState.Stopping, SessionState.Connected)
+        logWriter?.let {
+            it.append(kind = "state", detail = "stopping->connected")
+            it.close()
+        }
+        logWriter = null
+        eventWriter = null
+        handQualityMonitor = null
+        state = SessionState.Connected
+    }
+
     suspend fun disconnect() = mutex.withLock {
         requireState(SessionState.Connected, SessionState.Idle)
         for (s in streams) {
@@ -330,6 +362,7 @@ class SessionOrchestrator(
             SessionState.Connected to SessionState.Recording,
             SessionState.Recording to SessionState.Stopping,
             SessionState.Stopping to SessionState.Ingesting,
+            SessionState.Stopping to SessionState.Connected,
             SessionState.Ingesting to SessionState.Connected,
             SessionState.Connected to SessionState.Idle,
         )

@@ -1,6 +1,9 @@
 package io.opengraph.syncfield
 
 import com.google.common.truth.Truth.assertThat
+import io.opengraph.syncfield.audio.ChirpEmission
+import io.opengraph.syncfield.audio.ChirpPlayer
+import io.opengraph.syncfield.audio.ChirpSource
 import io.opengraph.syncfield.audio.ChirpSpec
 import io.opengraph.syncfield.audio.SilentChirpPlayer
 import io.opengraph.syncfield.writers.WriterFactory
@@ -127,11 +130,95 @@ class SessionOrchestratorTest {
         assertThat(File(dir, "session.log").exists()).isTrue()
         assertThat(File(dir, "manifest.json").exists()).isTrue()
     }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `start countdown runs after streams start and before audible start chirp`() = runTest {
+        val events = mutableListOf<String>()
+        val chirps = RecordingChirpPlayer(events)
+        val orch = SessionOrchestrator(
+            hostId = "h",
+            outputDirectory = tmp.root,
+            chirpPlayer = chirps,
+            startChirpSpec = ChirpSpec.audibleStart,
+            stopChirpSpec = null,
+            postStartStabilizationMs = 0.0,
+            preStopTailMarginMs = 0.0,
+        )
+        orch.add(FakeStream("cam", onStart = { events += "stream-start" }))
+        orch.connect()
+
+        orch.startRecording(
+            countdownSeconds = 3,
+            countdownIntervalMs = 0L,
+            onCountdownTick = { remaining -> events += "countdown-$remaining" },
+        )
+
+        assertThat(events).containsExactly(
+            "stream-start",
+            "countdown-3",
+            "countdown-2",
+            "countdown-1",
+            "chirp-400.0-2500.0",
+        ).inOrder()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `stop chirp plays before streams stop`() = runTest {
+        val events = mutableListOf<String>()
+        val orch = SessionOrchestrator(
+            hostId = "h",
+            outputDirectory = tmp.root,
+            chirpPlayer = RecordingChirpPlayer(events),
+            startChirpSpec = null,
+            stopChirpSpec = ChirpSpec.audibleStop,
+            postStartStabilizationMs = 0.0,
+            preStopTailMarginMs = 0.0,
+        )
+        orch.add(FakeStream("cam", onStop = { events += "stream-stop" }))
+        orch.connect()
+        orch.startRecording()
+
+        orch.stopRecording()
+
+        assertThat(events).containsExactly(
+            "chirp-2500.0-400.0",
+            "stream-stop",
+        ).inOrder()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `finishRecording closes stopped episode and returns to connected`() = runTest {
+        val orch = SessionOrchestrator(
+            hostId = "h",
+            outputDirectory = tmp.root,
+            chirpPlayer = SilentChirpPlayer(),
+            startChirpSpec = null,
+            stopChirpSpec = null,
+            postStartStabilizationMs = 0.0,
+            preStopTailMarginMs = 0.0,
+        )
+        val stream = FakeStream("cam")
+        orch.add(stream)
+        orch.connect()
+        orch.startRecording()
+        orch.stopRecording()
+
+        orch.finishRecording()
+
+        assertThat(orch.state).isEqualTo(SessionState.Connected)
+        orch.startRecording()
+        assertThat(orch.state).isEqualTo(SessionState.Recording)
+    }
 }
 
 private class FakeStream(
     override val streamId: String,
     private val failOnStart: Boolean = false,
+    private val onStart: () -> Unit = {},
+    private val onStop: () -> Unit = {},
 ) : SyncFieldStream {
 
     override val capabilities = StreamCapabilities(
@@ -154,10 +241,12 @@ private class FakeStream(
     override suspend fun startRecording(clock: SessionClock, writerFactory: WriterFactory) {
         if (failOnStart) throw RuntimeException("simulated start failure")
         startedRecording = true
+        onStart()
     }
 
     override suspend fun stopRecording(): StreamStopReport {
         stoppedRecording = true
+        onStop()
         return StreamStopReport(streamId, frameCount = 0, kind = "sensor")
     }
 
@@ -168,5 +257,20 @@ private class FakeStream(
 
     override suspend fun disconnect() {
         disconnected = true
+    }
+}
+
+private class RecordingChirpPlayer(
+    private val events: MutableList<String>,
+) : ChirpPlayer {
+    override val isSilent: Boolean = false
+
+    override suspend fun play(spec: ChirpSpec): ChirpEmission {
+        events += "chirp-${spec.fromHz}-${spec.toHz}"
+        return ChirpEmission(
+            softwareNs = System.nanoTime(),
+            hardwareNs = null,
+            source = ChirpSource.SoftwareFallback,
+        )
     }
 }
