@@ -113,6 +113,16 @@ class Insta360BLEController(
     @Volatile private var protocolSession: Insta360BleProtocolSession? = null
 
     /**
+     * Native command bridge mounted on top of [protocolSession]. This
+     * is where high-level commands (phone authorization, shutter,
+     * record start/stop, options I/O) actually execute — mirrors
+     * iOS's `INSCameraBasicCommands`. `null` until the protocol
+     * session is established.
+     */
+    @Volatile internal var oneDriverBridge: Insta360OneDriverBridge? = null
+        private set
+
+    /**
      * Listener for unsolicited BLE disconnects. Registered eagerly so we can
      * observe drops even when no in-flight command is running. Kept as a
      * field so [unpair] can deregister cleanly.
@@ -156,6 +166,8 @@ class Insta360BLEController(
         stopHeartbeat()
         unregisterDisconnectListener()
         val device = bleDevice
+        oneDriverBridge?.runCatching { close() }
+        oneDriverBridge = null
         protocolSession?.runCatching { close() }
         protocolSession = null
         commandQueue.runDeviceCommand(commandId(device), timeoutMs = 15_000L, retries = 0) {
@@ -177,82 +189,40 @@ class Insta360BLEController(
     }
 
     /**
-     * Send a BLE start-capture command and return the host-monotonic
-     * nanosecond timestamp at the moment the ACK landed.
+     * Send a BLE start-record command and return the host-monotonic
+     * nanosecond timestamp at the moment the ACK landed. Mirrors
+     * iOS `Insta360BLEController.startRemoteRecording`.
+     *
+     * Routed via [Insta360OneDriverBridge.startRecord] so the native
+     * SDK builds the packet; the live BLE session built during pair()
+     * is reused — we do NOT re-pair, which would tear down the active
+     * GATT channel and starve subsequent writes.
      */
     suspend fun startRemoteRecording(clock: SessionClock): Long {
         setup()
         val device = requireDevice()
         return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
-            connectDeviceWithRetry(device)
-            ensureNormalRecordMode()
-            if (!manager.isSdCardEnabled) {
-                throw Insta360Error.CommandFailed("SD card is not available")
-            }
-
-            val ack = CompletableDeferred<Long>()
-            val listener = object : ICaptureStatusListener {
-                override fun onCaptureWorking() {
-                    if (!ack.isCompleted) ack.complete(clock.nowMonotonicNs())
-                }
-
-                override fun onCaptureFinish(paths: Array<out String>?) = Unit
-
-                override fun onCaptureError(code: Int) {
-                    if (!ack.isCompleted) {
-                        ack.completeExceptionally(
-                            Insta360Error.CommandFailed("start capture error code=$code")
-                        )
-                    }
-                }
-            }
-            manager.setCaptureStatusListener(listener)
-            try {
-                manager.startNormalRecord()
-                withTimeout(10_000) { ack.await() }.also { lastStartAckNs = it }
-            } finally {
-                manager.setCaptureStatusListener(null)
-            }
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            bridge.startRecord(mode = 0)
+            val ackNs = clock.nowMonotonicNs()
+            lastStartAckNs = ackNs
+            ackNs
         }
     }
 
     /**
-     * Send a BLE stop-capture command and return the camera-side video
-     * URI from the SDK's completion callback.
+     * Stop record. Returns the camera-side video file URI captured
+     * from the SDK's `onDriverRecordVideoStateNotify` payload.
      */
     suspend fun stopRemoteRecording(): String {
         setup()
         val device = requireDevice()
         return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 45_000L, retries = 1) {
-            connectDeviceWithRetry(device)
-            val file = CompletableDeferred<String>()
-            val listener = object : ICaptureStatusListener {
-                override fun onCaptureFinish(paths: Array<out String>?) {
-                    val uri = paths?.firstOrNull { it.isNotBlank() }
-                    if (uri.isNullOrBlank()) {
-                        file.completeExceptionally(
-                            Insta360Error.CommandFailed("stop capture returned no file path")
-                        )
-                    } else {
-                        file.complete(uri)
-                    }
-                }
-
-                override fun onCaptureError(code: Int) {
-                    if (!file.isCompleted) {
-                        file.completeExceptionally(
-                            Insta360Error.CommandFailed("stop capture error code=$code")
-                        )
-                    }
-                }
-            }
-            manager.setCaptureStatusListener(listener)
-            try {
-                manager.stopNormalRecord()
-                withTimeout(20_000) { file.await() }
-            } finally {
-                manager.setCaptureStatusListener(null)
-            }
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            bridge.stopRecord(mode = 0)
+                ?: throw Insta360Error.CommandFailed("stop record returned no file uri")
         }
     }
 
@@ -278,33 +248,21 @@ class Insta360BLEController(
         }
     }
 
+    /**
+     * Trigger a still-image capture on the camera (identify-photo).
+     * Routed through [Insta360OneDriverBridge.captureStillImage] which
+     * writes the SDK's native shutter command on our protocol session —
+     * `InstaCameraManager.startNormalCapture()` does not work for us
+     * because the SDK's own OneDriver has no awareness of our bypass
+     * connection (returns error code -9999).
+     */
     suspend fun triggerIdentifyPhoto() {
         setup()
         val device = requireDevice()
         commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
-            connectDeviceWithRetry(device)
-            val result = CompletableDeferred<Unit>()
-            val listener = object : ICaptureStatusListener {
-                override fun onCaptureFinish(paths: Array<out String>?) {
-                    if (!result.isCompleted) result.complete(Unit)
-                }
-
-                override fun onCaptureError(code: Int) {
-                    if (!result.isCompleted) {
-                        result.completeExceptionally(
-                            Insta360Error.IdentifyPhotoFailed("capture error code=$code")
-                        )
-                    }
-                }
-            }
-            manager.setCaptureStatusListener(listener)
-            try {
-                ensureCaptureMode(CaptureMode.CAPTURE_NORMAL)
-                manager.startNormalCapture()
-                withTimeout(15_000) { result.await() }
-            } finally {
-                manager.setCaptureStatusListener(null)
-            }
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            bridge.captureStillImage(timeoutMs = 15_000L)
         }
     }
 
@@ -442,56 +400,109 @@ class Insta360BLEController(
     // --- Phone authorization -------------------------------------------------
 
     /**
-     * Phone authorization on Android.
+     * Phone authorization on Android — mirrors iOS's
+     * `Insta360BLEController.performPhoneAuthorization` semantically.
      *
-     * The Android Insta360 SDK 1.10.1 does **not** expose an explicit
-     * `requestCameraPermission` like the iOS SDK does. The authorization
-     * handshake is handled inside `connectBle()` — by the time [pair] returns,
-     * either the camera has accepted the phone or `connectBle` has thrown.
+     * Sequence (matches iOS):
+     *  1. Call `OneDriver.checkAuthorization(deviceId)` over our BLE
+     *     channel. Camera replies via `onDriverInfoNotify(what=78, err=state)`
+     *     where state is `Response.Authenticate.AUTHORIZED|UNAUTHORIZED|SYSTEMBUSY`.
+     *  2. If `AUTHORIZED`: already trusted, return [PhoneAuthorizationResult.Authorized]
+     *     immediately — no LCD prompt needed.
+     *  3. If `UNAUTHORIZED`: the camera firmware has begun showing
+     *     "이 앱의 접근을 허용할까요?" on its LCD. Invoke
+     *     [onCameraPromptStarted] so the host app can render its own
+     *     "ActionPod 을 확인하고 승인 눌러주세요" overlay with a 30 s timer.
+     *     Then suspend on `onDriverInfoNotify(what=80, err=Notification.Authorization.*)`
+     *     which carries the user's decision.
+     *  4. If `SYSTEMBUSY`: surface as `Rejected` (caller may retry later).
      *
-     * This method exists for API parity with iOS so the RN bridge surface
-     * is symmetric. It probes [Insta360IdentityStore] for a cached
-     * `PhoneAuthorizationCacheState.Authorized` record and resolves
-     * immediately, otherwise it triggers a [pair] (which will perform the
-     * implicit authorization) and marks the cache on success.
-     *
-     * On Android, the [onCameraPromptStarted] callback fires immediately
-     * (there is no separate "camera screen prompt" phase).
+     * @param uniqueId Stable, host-specific identifier for the phone.
+     *   Use [Insta360PhoneAuthDeviceId.stableId] which mirrors iOS's
+     *   `INSConnectionUtils.authorizationId()` (Settings.Secure.ANDROID_ID
+     *   on cold start, persisted in SharedPreferences thereafter).
      */
     suspend fun requestPhoneAuthorization(
+        uniqueId: String,
         timeoutSeconds: Long = 30,
         onCameraPromptStarted: (() -> Unit)? = null,
     ): PhoneAuthorizationResult {
         InstaLog.log(InstaLogCategory.BRIDGE, event = "phone_auth_required")
-        onCameraPromptStarted?.invoke()
+        setup()
+        // The bridge needs an active protocol session. If we don't have
+        // one yet, pair() opens the BLE channel + handshake; that itself
+        // does NOT show the LCD prompt — only the explicit
+        // checkAuthorization call below does.
+        if (oneDriverBridge == null || protocolSession == null) {
+            pair()
+        }
+        val bridge = oneDriverBridge
+            ?: throw Insta360Error.CommandFailed("OneDriver bridge unavailable after pair")
+
         return try {
-            withTimeout(timeoutSeconds * 1_000L) {
-                // The Android pair flow IS the authorization flow.
-                if (bleDevice != null && manager.cameraConnectedType == InstaCameraManager.CONNECT_TYPE_BLE) {
-                    PhoneAuthorizationResult.Authorized
-                } else {
-                    pair()
+            val initialState = bridge.checkAuthorization(uniqueId)
+            InstaLog.log(
+                InstaLogCategory.BRIDGE,
+                event = "phone_auth_initial_state",
+                fields = mapOf("state" to initialState),
+            )
+            when (initialState) {
+                OneDriverInfoConstants.AUTHENTICATE_AUTHORIZED -> {
+                    InstaLog.log(
+                        InstaLogCategory.BRIDGE,
+                        event = "phone_auth_result",
+                        fields = mapOf("result" to "already_authorized"),
+                    )
                     PhoneAuthorizationResult.Authorized
                 }
-            }.also {
-                InstaLog.log(
-                    InstaLogCategory.BRIDGE,
-                    event = "phone_auth_result",
-                    fields = mapOf("result" to "success"),
-                )
+                OneDriverInfoConstants.AUTHENTICATE_UNAUTHORIZED -> {
+                    // Camera LCD is now showing "Allow this phone?" — let the
+                    // host app render its overlay/timer.
+                    onCameraPromptStarted?.invoke()
+                    InstaLog.log(InstaLogCategory.BRIDGE, event = "phone_auth_prompt_started")
+                    val decision = bridge.awaitAuthorizationDecision(
+                        timeoutMs = timeoutSeconds * 1_000L + 5_000L,
+                    )
+                    InstaLog.log(
+                        InstaLogCategory.BRIDGE,
+                        event = "phone_auth_decision",
+                        fields = mapOf("decision" to decision),
+                    )
+                    when (decision) {
+                        OneDriverInfoConstants.AUTH_RESULT_SUCCESS -> PhoneAuthorizationResult.Authorized
+                        OneDriverInfoConstants.AUTH_RESULT_REJECT -> PhoneAuthorizationResult.Rejected
+                        OneDriverInfoConstants.AUTH_RESULT_TIMEOUT -> PhoneAuthorizationResult.TimedOut
+                        OneDriverInfoConstants.AUTH_RESULT_SYSTEM_BUSY -> PhoneAuthorizationResult.Rejected
+                        else -> PhoneAuthorizationResult.Rejected
+                    }
+                }
+                OneDriverInfoConstants.AUTHENTICATE_SYSTEMBUSY -> {
+                    InstaLog.log(
+                        InstaLogCategory.BRIDGE, level = InstaLogLevel.WARN,
+                        event = "phone_auth_result",
+                        fields = mapOf("result" to "system_busy"),
+                    )
+                    PhoneAuthorizationResult.Rejected
+                }
+                else -> {
+                    InstaLog.log(
+                        InstaLogCategory.BRIDGE, level = InstaLogLevel.WARN,
+                        event = "phone_auth_unknown_state",
+                        fields = mapOf("state" to initialState),
+                    )
+                    PhoneAuthorizationResult.Rejected
+                }
             }
         } catch (e: TimeoutCancellationException) {
             InstaLog.log(
-                InstaLogCategory.BRIDGE,
-                level = InstaLogLevel.WARN,
+                InstaLogCategory.BRIDGE, level = InstaLogLevel.WARN,
                 event = "phone_auth_result",
                 fields = mapOf("result" to "timeout"),
             )
             PhoneAuthorizationResult.TimedOut
         } catch (e: Throwable) {
             InstaLog.log(
-                InstaLogCategory.BRIDGE,
-                level = InstaLogLevel.WARN,
+                InstaLogCategory.BRIDGE, level = InstaLogLevel.WARN,
                 event = "phone_auth_result",
                 fields = mapOf("result" to "failure", "error" to (e.message ?: e::class.java.simpleName)),
             )
@@ -500,12 +511,14 @@ class Insta360BLEController(
     }
 
     /**
-     * Cancel an in-flight [requestPhoneAuthorization]. On Android this maps to
-     * disconnecting the BLE channel since pairing IS authorization.
+     * Cancel an in-flight [requestPhoneAuthorization]. Mirrors iOS's
+     * `cancelPendingPhoneAuthorization` — calls
+     * `OneDriver.cancelRequestAuthorization(BLE_CONNECT)` which drops
+     * the camera-side LCD prompt. Caller's [requestPhoneAuthorization]
+     * coroutine sees the resulting TIMEOUT/SYSTEM_BUSY notification.
      */
     suspend fun cancelPendingPhoneAuthorization() {
-        if (!Insta360OneSDKBridge.available) return
-        runCatching { manager.disconnectBle() }
+        oneDriverBridge?.cancelAuthorization()
         InstaLog.log(
             InstaLogCategory.BRIDGE,
             event = "phone_auth_result",
@@ -625,7 +638,37 @@ class Insta360BLEController(
         try {
             val session = Insta360GattHandshake.handshake(device)
             protocolSession?.runCatching { close() } // drop any stale prior session
+            oneDriverBridge?.runCatching { close() }
             protocolSession = session
+            // Mount the JNI command bridge on top so high-level commands
+            // (auth, shutter, record) can flow through native packet
+            // construction over our BLE channel.
+            oneDriverBridge = runCatching {
+                Insta360OneDriverBridge.attach(context, session)
+            }.getOrElse { t ->
+                // Walk the cause chain so the *root* native-loader / linker
+                // failure is visible — top-level message is often just the
+                // class name (ClassNotFoundException semantics).
+                val causes = generateSequence(t as Throwable?) { it.cause }
+                    .toList()
+                    .joinToString(" <- ") { c ->
+                        "${c::class.java.simpleName}(${c.message ?: ""})"
+                    }
+                android.util.Log.e(
+                    "INSTA360_BLE",
+                    "onedriver_bridge_attach_failed: $causes",
+                    t,
+                )
+                InstaLog.log(
+                    InstaLogCategory.BLE, level = InstaLogLevel.WARN,
+                    event = "onedriver_bridge_attach_failed",
+                    fields = mapOf(
+                        "top" to (t.message ?: t::class.java.simpleName),
+                        "causes" to causes,
+                    ),
+                )
+                null
+            }
             setConnectedIdentity(device)
         } catch (t: Throwable) {
             InstaLog.log(
