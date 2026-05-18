@@ -13,6 +13,7 @@ import io.opengraph.syncfield.insta360.logging.InstaLog
 import io.opengraph.syncfield.insta360.logging.InstaLogCategory
 import io.opengraph.syncfield.insta360.logging.InstaLogLevel
 import io.opengraph.syncfield.writers.WriterFactory
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.Json
@@ -141,14 +142,45 @@ class Insta360CameraStream(
         val destination = File(episodeDirectory, "$streamId.mp4")
         val sidecar = Insta360PendingSidecar.scan(episodeDirectory)
             .firstOrNull { it.streamId == streamId }
-        wifi.download(
-            remoteFileURI = uri,
-            destination = destination,
-            ssid = ssid,
-            passphrase = passphrase,
-            sidecar = sidecar,
-            progress = progress,
-        )
+        var downloadSessionOpened = false
+        try {
+            ble.beginCameraFileDownloadSession(totalFiles = 1)
+            downloadSessionOpened = true
+            delay(300L)
+            ble.setHeartbeatIntervalMs(null)
+            try {
+                wifi.download(
+                    remoteFileURI = uri,
+                    destination = destination,
+                    ssid = ssid,
+                    passphrase = passphrase,
+                    sidecar = sidecar,
+                    progress = progress,
+                )
+            } finally {
+                ble.setHeartbeatIntervalMs(Insta360CoordinatorConfig.heartbeatIntervalMs)
+            }
+        } finally {
+            if (downloadSessionOpened) {
+                runCatching {
+                    ble.finishCameraFileDownloadSession(
+                        totalFiles = 1,
+                        successFiles = if (destination.exists() && destination.length() > 0L) 1 else 0,
+                        failed = !destination.exists() || destination.length() <= 0L,
+                    )
+                }.onFailure { t ->
+                    InstaLog.log(
+                        InstaLogCategory.WIFI,
+                        level = InstaLogLevel.WARN,
+                        event = "stream_download_session_finish_failed",
+                        fields = mapOf(
+                            "stream_id" to streamId,
+                            "error" to (t.message ?: t::class.java.simpleName),
+                        ),
+                    )
+                }
+            }
+        }
 
         // Persist BLE-ACK anchor sidecar so downstream alignment can map
         // the camera's internal PTS into host monotonic ns.

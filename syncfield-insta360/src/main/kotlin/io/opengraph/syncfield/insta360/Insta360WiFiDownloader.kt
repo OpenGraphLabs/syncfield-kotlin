@@ -77,11 +77,6 @@ class Insta360WiFiDownloader(private val context: Context) {
 
     private val defaultCameraHost = "192.168.42.1"
     private val cameraPort = 6666
-    private val sdkWifiDownloadSetupDelayMs = 300L
-
-    // com.arashivision.onecamera.OneDriverInfo.Request.AccessCameraFileState
-    private val cameraFileAccessStateIdle = 1
-    private val cameraFileAccessStateDownload = 3
 
     data class BatchItem(
         val episodeDir: File,
@@ -545,15 +540,9 @@ class Insta360WiFiDownloader(private val context: Context) {
         val cameraPath = normalizedCameraFileURI(remoteFileURI)
         var socket: Socket? = null
         var endpoint = DownloadEndpoint(cameraHost, cameraPort, cameraPath, "")
-        var accessStateSet = false
 
         var written = 0L
         try {
-            ensureSdkWifiCameraOpen(timeoutMs = 12_000L)
-            setCameraFileAccessState(cameraFileAccessStateDownload)
-            accessStateSet = true
-            delay(sdkWifiDownloadSetupDelayMs)
-
             endpoint = resolveDownloadEndpoint(cameraHost, cameraPath)
             val network = cm.boundNetworkForProcess
             socket = network?.socketFactory?.createSocket() ?: Socket()
@@ -566,7 +555,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "path" to endpoint.path,
                     "network" to (network?.networkHandle ?: -1L),
                     "destination" to destination.absolutePath,
-                    "transport" to "raw_socket_sdk_session",
+                    "transport" to "raw_socket",
                     "sdk_http_prefix" to endpoint.sdkHttpPrefix,
                 ),
             )
@@ -599,7 +588,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "status" to code,
                     "content_length" to total,
                     "chunked" to chunked,
-                    "transport" to "raw_socket_sdk_session",
+                    "transport" to "raw_socket",
                 ),
             )
             if (code !in 200..299) {
@@ -633,10 +622,6 @@ class Insta360WiFiDownloader(private val context: Context) {
             throw Insta360Error.DownloadFailed(t.message ?: "unknown")
         } finally {
             runCatching { socket?.close() }
-            if (accessStateSet) {
-                setCameraFileAccessState(cameraFileAccessStateIdle)
-            }
-            closeSdkWifiCamera()
         }
         return written
     }

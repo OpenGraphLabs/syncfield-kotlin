@@ -14,6 +14,7 @@ import com.arashivision.onecamera.cameraresponse.StreamData
 import com.arashivision.onecamera.cameraresponse.TakePictureResponse
 import com.arashivision.onecamera.cameraresponse.TakePictureWithoutStorageResponse
 import com.arashivision.onecamera.cameraresponse.VideoResult
+import com.arashivision.onecamera.camerarequest.DownLoadInfo
 import com.arashivision.camera.wifiproxy.IWifiProxyData
 import io.opengraph.syncfield.insta360.logging.InstaLog
 import io.opengraph.syncfield.insta360.logging.InstaLogCategory
@@ -409,6 +410,103 @@ internal class Insta360OneDriverBridge private constructor(
         } finally {
             collector.cancel()
         }
+    }
+
+    suspend fun setCameraFileAccessState(
+        state: Int,
+        timeoutMs: Long = 5_000L,
+        requireSuccess: Boolean = false,
+    ): Int? {
+        if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
+        val ack = CompletableDeferred<Int>()
+        val collector = bridgeScope.launch {
+            infoNotifications
+                .filter { it.what == OneDriverInfo.Response.InfoType.SET_ACCESS_CAMERA_FILE_STATE }
+                .collect { event ->
+                    if (!ack.isCompleted) ack.complete(event.err)
+                }
+        }
+        try {
+            val requestId = oneDriver.setAccessCameraFileState(state)
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "onedriver_set_file_access_state_sent",
+                fields = mapOf("requestId" to requestId, "state" to state),
+            )
+            if (requestId < 0) {
+                throw Insta360Error.CommandFailed(
+                    "set camera file access state returned requestId=$requestId"
+                )
+            }
+            val code = withTimeoutOrNull(timeoutMs) { ack.await() }
+            when {
+                code == null -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "onedriver_set_file_access_state_timeout_continue",
+                        fields = mapOf("state" to state, "timeout_ms" to timeoutMs),
+                    )
+                }
+                code == 0 -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        event = "onedriver_set_file_access_state_ok",
+                        fields = mapOf("state" to state),
+                    )
+                }
+                requireSuccess -> {
+                    throw Insta360Error.CommandFailed(
+                        "set camera file access state failed code=$code state=$state"
+                    )
+                }
+                else -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "onedriver_set_file_access_state_failed_continue",
+                        fields = mapOf("state" to state, "code" to code),
+                    )
+                }
+            }
+            return code
+        } finally {
+            collector.cancel()
+        }
+    }
+
+    fun updateDownloadInfo(
+        totalNum: Int,
+        currentNum: Int,
+        percentage: Double,
+        status: DownLoadInfo.Status,
+        successNum: Int,
+    ): Long {
+        if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
+        val info = DownLoadInfo().apply {
+            setTotalNum(totalNum)
+            setCurrentNum(currentNum)
+            setPercentage(percentage.coerceIn(0.0, 1.0))
+            setStatus(status.getNativeValue())
+            setSuccessNum(successNum)
+        }
+        val requestId = oneDriver.updateDownloadInfo(info)
+        InstaLog.log(
+            InstaLogCategory.BLE,
+            event = "onedriver_update_download_info_sent",
+            fields = mapOf(
+                "requestId" to requestId,
+                "total_num" to totalNum,
+                "current_num" to currentNum,
+                "percentage" to percentage.coerceIn(0.0, 1.0),
+                "status" to status.name,
+                "success_num" to successNum,
+            ),
+        )
+        if (requestId < 0) {
+            throw Insta360Error.CommandFailed("update download info returned requestId=$requestId")
+        }
+        return requestId
     }
 
     /**

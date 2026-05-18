@@ -1,6 +1,8 @@
 package io.opengraph.syncfield.insta360
 
 import android.content.Context
+import com.arashivision.onecamera.OneDriverInfo
+import com.arashivision.onecamera.camerarequest.DownLoadInfo
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.camera.callback.ICameraChangedCallback
 import com.arashivision.sdkcamera.camera.callback.ICaptureStatusListener
@@ -362,6 +364,73 @@ class Insta360BLEController(
                 ),
             )
             ssid to resolved.password
+        }
+    }
+
+    suspend fun beginCameraFileDownloadSession(totalFiles: Int) {
+        setup()
+        val device = requireDevice()
+        commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 20_000L,
+            retries = 1,
+            sdkCritical = false,
+        ) {
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            bridge.setCameraFileAccessState(
+                state = OneDriverInfo.Request.AccessCameraFileState.DOWNLOAD,
+                requireSuccess = true,
+            )
+            bridge.updateDownloadInfo(
+                totalNum = totalFiles.coerceAtLeast(1),
+                currentNum = 0,
+                percentage = 0.0,
+                status = DownLoadInfo.Status.DOWNLOADING,
+                successNum = 0,
+            )
+        }
+    }
+
+    suspend fun finishCameraFileDownloadSession(
+        totalFiles: Int,
+        successFiles: Int,
+        failed: Boolean,
+    ) {
+        setup()
+        val device = requireDevice()
+        commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 15_000L,
+            retries = 0,
+            sdkCritical = false,
+        ) {
+            val bridge = oneDriverBridge
+                ?: throw Insta360Error.NotPaired
+            runCatching {
+                bridge.updateDownloadInfo(
+                    totalNum = totalFiles.coerceAtLeast(1),
+                    currentNum = successFiles.coerceAtLeast(0),
+                    percentage = if (failed) {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                    status = if (failed) DownLoadInfo.Status.FAIL else DownLoadInfo.Status.SUCCESS,
+                    successNum = successFiles.coerceAtLeast(0),
+                )
+            }.onFailure {
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    level = InstaLogLevel.WARN,
+                    event = "onedriver_finish_download_info_failed",
+                    fields = mapOf("error" to (it.message ?: it::class.java.simpleName)),
+                )
+            }
+            bridge.setCameraFileAccessState(
+                state = OneDriverInfo.Request.AccessCameraFileState.IDLE,
+                requireSuccess = false,
+            )
         }
     }
 

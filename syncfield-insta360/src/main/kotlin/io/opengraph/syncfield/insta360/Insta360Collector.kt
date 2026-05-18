@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -283,32 +284,59 @@ object Insta360Collector {
                 }
 
                 // Wrap download in coordinator's radio gate — heartbeat throttling
-                val batchResults = Insta360ConnectionCoordinator.withWiFi(uuid) {
-                    for (p in list) {
-                        progress(Progress(p.episodeDir, p.sidecar.streamId, uuid, p.sidecar.role, "awaiting_wifi_join", 0.0, ssid = ssid))
+                var downloadSessionOpened = false
+                var batchResults: List<Insta360WiFiDownloader.BatchResult> = emptyList()
+                try {
+                    controller.beginCameraFileDownloadSession(totalFiles = batchItems.size)
+                    downloadSessionOpened = true
+                    delay(300L)
+                    batchResults = Insta360ConnectionCoordinator.withWiFi(uuid) {
+                        for (p in list) {
+                            progress(Progress(p.episodeDir, p.sidecar.streamId, uuid, p.sidecar.role, "awaiting_wifi_join", 0.0, ssid = ssid))
+                        }
+                        downloader.downloadBatch(
+                            ssid = ssid,
+                            passphrase = passphrase,
+                            items = batchItems,
+                            onItemStart = { item ->
+                                // synchronous callback — we can't suspend here. Log only.
+                                InstaLog.log(
+                                    InstaLogCategory.COLLECT, event = "download_started",
+                                    fields = mapOf("stream_id" to item.streamId),
+                                )
+                            },
+                            progress = { item, frac ->
+                                // also synchronous; cannot call suspend progress
+                                // (downloader doesn't support suspending progress callbacks)
+                                // Bridge will receive per-completion events below.
+                                InstaLog.log(
+                                    InstaLogCategory.COLLECT, level = InstaLogLevel.DEBUG,
+                                    event = "download_progress",
+                                    fields = mapOf("stream_id" to item.streamId, "fraction" to frac),
+                                )
+                            },
+                        )
                     }
-                    downloader.downloadBatch(
-                        ssid = ssid,
-                        passphrase = passphrase,
-                        items = batchItems,
-                        onItemStart = { item ->
-                            // synchronous callback — we can't suspend here. Log only.
-                            InstaLog.log(
-                                InstaLogCategory.COLLECT, event = "download_started",
-                                fields = mapOf("stream_id" to item.streamId),
+                } finally {
+                    if (downloadSessionOpened) {
+                        runCatching {
+                            controller.finishCameraFileDownloadSession(
+                                totalFiles = batchItems.size,
+                                successFiles = batchResults.count { it.success },
+                                failed = batchResults.any { !it.success } || batchResults.size != batchItems.size,
                             )
-                        },
-                        progress = { item, frac ->
-                            // also synchronous; cannot call suspend progress
-                            // (downloader doesn't support suspending progress callbacks)
-                            // Bridge will receive per-completion events below.
+                        }.onFailure { t ->
                             InstaLog.log(
-                                InstaLogCategory.COLLECT, level = InstaLogLevel.DEBUG,
-                                event = "download_progress",
-                                fields = mapOf("stream_id" to item.streamId, "fraction" to frac),
+                                InstaLogCategory.COLLECT,
+                                level = InstaLogLevel.WARN,
+                                event = "download_session_finish_failed",
+                                fields = mapOf(
+                                    "uuid" to uuid,
+                                    "error" to (t.message ?: t::class.java.simpleName),
+                                ),
                             )
-                        },
-                    )
+                        }
+                    }
                 }
 
                 // Per-item: emit done/failed + remove pending sidecar on success
