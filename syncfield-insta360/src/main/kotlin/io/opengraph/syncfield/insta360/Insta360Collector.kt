@@ -109,6 +109,20 @@ object Insta360Collector {
         return collectInternal(context, pendings, progress)
     }
 
+    /** List downloadable files for one paired camera over its Wi-Fi AP. */
+    suspend fun listFiles(
+        context: Context,
+        uuid: String,
+        @Suppress("UNUSED_PARAMETER")
+        preferredName: String? = null,
+    ): List<Insta360FileInfo> {
+        val controller = Insta360BluetoothHub.pair(context, uuid)
+        val (ssid, passphrase) = controller.wifiCredentials()
+        return Insta360ConnectionCoordinator.withWiFi(uuid) {
+            Insta360WiFiDownloader(context).listFiles(ssid, passphrase)
+        }
+    }
+
     /** Cancel any in-flight collect job. Safe to call when nothing is running. */
     suspend fun cancel() {
         cancelMutex.withLock {
@@ -261,6 +275,7 @@ object Insta360Collector {
                         remoteFileURI = p.sidecar.cameraFileURI,
                         destination = File(p.episodeDir, "${p.sidecar.streamId}.mp4"),
                         bleAckMonotonicNs = p.sidecar.bleAckMonotonicNs,
+                        sidecar = p.sidecar,
                     )
                 }
 

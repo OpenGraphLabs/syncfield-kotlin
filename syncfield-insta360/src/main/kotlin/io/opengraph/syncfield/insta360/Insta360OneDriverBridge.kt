@@ -318,14 +318,18 @@ internal class Insta360OneDriverBridge private constructor(
      */
     suspend fun startRecord(mode: Int = 0, timeoutMs: Long = 10_000L): Int {
         if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
-        // Capture state notification — `state` semantics:
-        //   1 = STARTED, 2 = STOPPED (matches iOS captureStatus enum)
+        // Capture state notification — observed GO 3S Android OneDriver
+        // semantics: 0 = recording started, 1 = stopped. Waiting for iOS-like
+        // 1/2 values makes each command sit until timeout before the next
+        // wrist camera can run.
         val ack = CompletableDeferred<Int>()
         val collector = bridgeScope.launch {
             infoNotifications
                 .filter { it.what == RECORD_VIDEO_STATE_WHAT }
                 .collect { event ->
-                    if (!ack.isCompleted) ack.complete(event.err)
+                    if (Insta360RecordState.isStarted(event.err) && !ack.isCompleted) {
+                        ack.complete(event.err)
+                    }
                 }
         }
         try {
@@ -352,22 +356,30 @@ internal class Insta360OneDriverBridge private constructor(
         mode: Int = 0,
         extraMeta: ByteArray = ByteArray(0),
         timeoutMs: Long = 20_000L,
-    ): String? {
+    ): String? = stopRecordAck(mode, extraMeta, timeoutMs).cameraFileURI
+
+    internal suspend fun stopRecordAck(
+        mode: Int = 0,
+        extraMeta: ByteArray = ByteArray(0),
+        timeoutMs: Long = 20_000L,
+    ): StopRecordAck {
         if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
-        val ack = CompletableDeferred<String?>()
+        val ack = CompletableDeferred<StopRecordAck>()
         val collector = bridgeScope.launch {
             infoNotifications
                 .filter { it.what == RECORD_VIDEO_STATE_WHAT }
                 .collect { event ->
+                    if (!Insta360RecordState.isStopped(event.err)) return@collect
                     val result = event.obj as? VideoResult
                     val uri = result?.video?.uri?.takeIf { it.isNotBlank() }
-                    if (!ack.isCompleted) ack.complete(uri)
+                    if (!ack.isCompleted) ack.complete(StopRecordAck(uri))
                 }
         }
         try {
             oneDriver.stopRecordWithCameraStorage(mode, extraMeta)
             InstaLog.log(InstaLogCategory.BLE, event = "onedriver_stop_record_sent")
             return withTimeoutOrNull(timeoutMs) { ack.await() }
+                ?: throw Insta360Error.CommandFailed("stop record timed out waiting for stopped state")
         } finally {
             collector.cancel()
         }
@@ -422,6 +434,7 @@ internal class Insta360OneDriverBridge private constructor(
     }
 
     data class InfoEvent(val what: Int, val err: Int, val obj: Any?)
+    internal data class StopRecordAck(val cameraFileURI: String?)
 
     companion object {
         // Pseudo-`what` codes for callbacks that don't carry one. We
@@ -434,4 +447,12 @@ internal class Insta360OneDriverBridge private constructor(
             session: Insta360BleProtocolSession,
         ): Insta360OneDriverBridge = Insta360OneDriverBridge(context, session)
     }
+}
+
+internal object Insta360RecordState {
+    private const val STARTED = 0
+    private const val STOPPED = 1
+
+    fun isStarted(state: Int): Boolean = state == STARTED
+    fun isStopped(state: Int): Boolean = state == STOPPED
 }

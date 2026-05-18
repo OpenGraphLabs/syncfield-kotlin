@@ -9,6 +9,8 @@ import android.net.NetworkRequest
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import androidx.annotation.RequiresApi
+import com.arashivision.sdkcamera.camera.InstaCameraManager
+import com.arashivision.sdkcamera.camera.callback.ICameraOperateCallback
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -16,6 +18,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.Instant
+import java.time.format.DateTimeFormatter
 
 internal object Insta360WiFiReachabilityPolicy {
     val probeDelaysMs: List<Long> = listOf(
@@ -61,6 +65,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         val remoteFileURI: String,
         val destination: File,
         val bleAckMonotonicNs: Long,
+        val sidecar: Insta360PendingSidecar? = null,
     )
 
     data class BatchResult(
@@ -81,13 +86,23 @@ class Insta360WiFiDownloader(private val context: Context) {
         destination: File,
         ssid: String,
         passphrase: String,
+        sidecar: Insta360PendingSidecar? = null,
         progress: (Double) -> Unit,
     ): Long {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = applyNetworkSuggestion(cm, ssid, passphrase)
         try {
             waitForReachability(cm)
-            return fetchResource(cm, remoteFileURI, destination, progress)
+            var written = 0L
+            for ((uri, dst) in resolveRemoteDestinations(
+                cm = cm,
+                remoteFileURI = remoteFileURI,
+                destination = destination,
+                sidecar = sidecar,
+            )) {
+                written += fetchResource(cm, uri, dst, progress)
+            }
+            return written
         } finally {
             releaseCameraNetwork(cm, callback)
         }
@@ -109,18 +124,41 @@ class Insta360WiFiDownloader(private val context: Context) {
             items.map { item ->
                 runCatching {
                     onItemStart(item)
-                    fetchResource(
+                    for ((uri, dst) in resolveRemoteDestinations(
                         cm = cm,
                         remoteFileURI = item.remoteFileURI,
                         destination = item.destination,
-                        progress = { progress(item, it) },
-                    )
+                        sidecar = item.sidecar,
+                    )) {
+                        fetchResource(
+                            cm = cm,
+                            remoteFileURI = uri,
+                            destination = dst,
+                            progress = { progress(item, it) },
+                        )
+                    }
                     BatchResult(item, success = true)
                 }.getOrElse {
                     BatchResult(item, success = false, error = it.localizedMessage ?: it.toString())
                 }
             }
         } finally {
+            releaseCameraNetwork(cm, callback)
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    suspend fun listFiles(
+        ssid: String,
+        passphrase: String,
+    ): List<Insta360FileInfo> {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = applyNetworkSuggestion(cm, ssid, passphrase)
+        return try {
+            waitForReachability(cm)
+            fetchCameraFileInfoList()
+        } finally {
+            closeCameraWifi()
             releaseCameraNetwork(cm, callback)
         }
     }
@@ -203,7 +241,7 @@ class Insta360WiFiDownloader(private val context: Context) {
     ): Long {
         destination.parentFile?.mkdirs()
 
-        val url = URL("http://$cameraHost:$cameraPort$remoteFileURI")
+        val url = URL("http://$cameraHost:$cameraPort${normalizedCameraFileURI(remoteFileURI)}")
         val network = cm.boundNetworkForProcess
         val conn = ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).apply {
             connectTimeout = 10_000
@@ -235,6 +273,152 @@ class Insta360WiFiDownloader(private val context: Context) {
             conn.disconnect()
         }
         return written
+    }
+
+    private suspend fun resolveRemoteDestinations(
+        cm: ConnectivityManager,
+        remoteFileURI: String,
+        destination: File,
+        sidecar: Insta360PendingSidecar?,
+    ): List<Pair<String, File>> {
+        val uris = resolveRemoteFileURIIfNeeded(remoteFileURI, sidecar)
+        return uris.zip(destinationsFor(uris, destination))
+    }
+
+    private suspend fun resolveRemoteFileURIIfNeeded(
+        remoteFileURI: String,
+        sidecar: Insta360PendingSidecar?,
+    ): List<String> {
+        if (!Insta360PendingSidecar.needsCameraFileURIResolution(remoteFileURI)) {
+            return listOf(normalizedCameraFileURI(remoteFileURI))
+        }
+
+        val uris = fetchCameraFileInfoList().map { it.fileUri }
+        val start = sidecar?.bleAckWallClockMs
+        val stop = sidecar?.stopWallClockMs
+        if (start != null && stop != null) {
+            val matched = Insta360PendingResolver.matchSegments(
+                uris = uris,
+                window = Insta360PendingResolver.Window(
+                    startWallMs = start,
+                    endWallMs = stop,
+                    expectedDurationSec = sidecar.cameraDurationSec?.toInt(),
+                    expectedSegments = sidecar.expectedSegments,
+                ),
+            )
+            if (matched.isNotEmpty()) return matched
+            throw Insta360Error.DownloadFailed(
+                "no camera mp4 in expected window [$start..$stop] for ${sidecar.streamId}; camera has ${uris.size} files")
+        }
+
+        val resolved = Insta360VideoURIFallback.bestCandidate(uris)
+            ?: throw Insta360Error.DownloadFailed(
+                "could not resolve camera video URI after stopCapture returned no URI")
+        return listOf(resolved)
+    }
+
+    private suspend fun fetchCameraFileInfoList(): List<Insta360FileInfo> {
+        var lastError: Throwable? = null
+        repeat(2) { attempt ->
+            try {
+                openCameraWifi()
+                val manager = Insta360OneSDKBridge.manager
+                val urls = (manager.getAllUrlListIncludeRecording() + manager.rawUrlListOrEmpty())
+                    .mapNotNull(::normalizedCameraFileURIOrNull)
+                    .filter(::isDownloadableCameraVideoURI)
+                    .distinct()
+                if (urls.isNotEmpty()) {
+                    return urls
+                        .map(::fileInfo)
+                        .sortedWith(compareByDescending<Insta360FileInfo> { it.createdAtIso }
+                            .thenBy { it.fileUri })
+                }
+                lastError = Insta360Error.DownloadFailed("camera file list returned empty")
+            } catch (t: Throwable) {
+                lastError = t
+            } finally {
+                closeCameraWifi()
+            }
+            if (attempt == 0) delay(500)
+        }
+        throw Insta360Error.DownloadFailed(
+            "camera album listing failed (${lastError?.message ?: "unknown"})")
+    }
+
+    private suspend fun openCameraWifi() {
+        val result = CompletableDeferred<Unit>()
+        Insta360OneSDKBridge.manager.openCameraWifi(object : ICameraOperateCallback {
+            override fun onSuccessful() {
+                if (!result.isCompleted) result.complete(Unit)
+            }
+
+            override fun onFailed() {
+                if (!result.isCompleted) {
+                    result.completeExceptionally(
+                        Insta360Error.DownloadFailed("openCameraWifi failed"))
+                }
+            }
+
+            override fun onCameraConnectError() {
+                if (!result.isCompleted) {
+                    result.completeExceptionally(
+                        Insta360Error.DownloadFailed("openCameraWifi camera connect error"))
+                }
+            }
+        })
+        withTimeoutOrNull(12_000) { result.await() }
+            ?: throw Insta360Error.DownloadFailed("openCameraWifi timed out after 12s")
+    }
+
+    private fun closeCameraWifi() {
+        runCatching {
+            Insta360OneSDKBridge.manager.closeCameraWifi(object : ICameraOperateCallback {
+                override fun onSuccessful() = Unit
+                override fun onFailed() = Unit
+                override fun onCameraConnectError() = Unit
+            })
+        }
+    }
+
+    private fun InstaCameraManager.rawUrlListOrEmpty(): List<String> =
+        runCatching { getRawUrlList() }.getOrDefault(emptyList())
+
+    private fun destinationsFor(uris: List<String>, destination: File): List<File> {
+        if (uris.size <= 1) return listOf(destination)
+        val parent = destination.parentFile ?: File(".")
+        val stem = destination.nameWithoutExtension
+        val ext = destination.extension.takeIf { it.isNotBlank() } ?: "mp4"
+        return uris.indices.map { index ->
+            File(parent, "%s_seg%02d.%s".format(stem, index + 1, ext))
+        }
+    }
+
+    private fun normalizedCameraFileURI(raw: String): String =
+        normalizedCameraFileURIOrNull(raw) ?: raw
+
+    private fun normalizedCameraFileURIOrNull(raw: String?): String? {
+        val value = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return runCatching {
+            val url = URL(value)
+            if (url.host == cameraHost && url.path.isNotBlank()) url.path else value
+        }.getOrElse { value }
+    }
+
+    private fun fileInfo(uri: String): Insta360FileInfo {
+        val createdAtIso = Insta360PendingResolver.parseFilenameTimestampMs(uri)
+            ?.let { DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(it)) }
+            ?: DateTimeFormatter.ISO_INSTANT.format(Instant.EPOCH)
+        return Insta360FileInfo(
+            fileUri = uri,
+            createdAtIso = createdAtIso,
+            durationSec = 0.0,
+            sizeBytes = 0L,
+        )
+    }
+
+    private fun isDownloadableCameraVideoURI(uri: String): Boolean {
+        val lower = uri.lowercase()
+        return (lower.endsWith(".mp4") || lower.endsWith(".insv")) && !lower.contains("lrv")
     }
 
     private suspend fun releaseCameraNetwork(

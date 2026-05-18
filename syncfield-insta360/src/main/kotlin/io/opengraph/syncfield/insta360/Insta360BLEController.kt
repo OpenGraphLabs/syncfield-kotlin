@@ -23,6 +23,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 
+data class Insta360StopCaptureResult(
+    val cameraFileURI: String?,
+    val confirmedStopped: Boolean,
+    val attempts: Int,
+    val diagnostic: String? = null,
+    val stopWallClockMs: Long? = null,
+)
+
 /**
  * BLE controller for a single Insta360 Go 3S camera.
  *
@@ -201,7 +209,12 @@ class Insta360BLEController(
     suspend fun startRemoteRecording(clock: SessionClock): Long {
         setup()
         val device = requireDevice()
-        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
+        return commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 30_000L,
+            retries = 1,
+            sdkCritical = false,
+        ) {
             val bridge = oneDriverBridge
                 ?: throw Insta360Error.NotPaired
             bridge.startRecord(mode = 0)
@@ -216,13 +229,34 @@ class Insta360BLEController(
      * from the SDK's `onDriverRecordVideoStateNotify` payload.
      */
     suspend fun stopRemoteRecording(): String {
+        val result = stopRemoteRecordingReliably()
+        return result.cameraFileURI?.takeIf { it.isNotBlank() }
+            ?: throw Insta360Error.CommandFailed(
+                result.diagnostic ?: "stop record confirmed stop but returned no file uri"
+            )
+    }
+
+    suspend fun stopRemoteRecordingReliably(): Insta360StopCaptureResult {
         setup()
         val device = requireDevice()
-        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 45_000L, retries = 1) {
+        val stopWallClockMs = System.currentTimeMillis()
+        return commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 45_000L,
+            retries = 1,
+            sdkCritical = false,
+        ) {
             val bridge = oneDriverBridge
                 ?: throw Insta360Error.NotPaired
-            bridge.stopRecord(mode = 0)
-                ?: throw Insta360Error.CommandFailed("stop record returned no file uri")
+            val ack = bridge.stopRecordAck(mode = 0)
+            val uri = ack.cameraFileURI?.takeIf { it.isNotBlank() }
+            Insta360StopCaptureResult(
+                cameraFileURI = uri,
+                confirmedStopped = true,
+                attempts = 1,
+                diagnostic = if (uri == null) "stop record acked without uri" else null,
+                stopWallClockMs = stopWallClockMs,
+            )
         }
     }
 

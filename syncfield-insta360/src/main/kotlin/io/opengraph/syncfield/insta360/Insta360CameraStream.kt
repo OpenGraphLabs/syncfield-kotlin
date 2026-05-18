@@ -50,6 +50,7 @@ class Insta360CameraStream(
     private var healthBus: HealthBus? = null
     /** Host-monotonic nanoseconds at the moment the BLE start-capture ACK was received. */
     private var bleAckMonotonicNs: Long = 0L
+    private var bleAckWallClockMs: Long? = null
     private var cameraFileURI: String? = null
     private var currentEpisodeDirectory: File? = null
 
@@ -73,10 +74,25 @@ class Insta360CameraStream(
     override suspend fun startRecording(clock: SessionClock, writerFactory: WriterFactory) {
         currentEpisodeDirectory = writerFactory.videoFile(streamId).parentFile
         bleAckMonotonicNs = ble.startRemoteRecording(clock)
+        bleAckWallClockMs = System.currentTimeMillis()
+        val episodeDir = currentEpisodeDirectory
+        if (episodeDir != null) {
+            runCatching {
+                Insta360PendingSidecar.writeTentative(
+                    episodeDir = episodeDir,
+                    streamId = streamId,
+                    role = roleFromStreamId(streamId),
+                    deviceUuid = resolvedDeviceUuid(),
+                    deviceName = resolvedDeviceName(),
+                    bleAckNs = bleAckMonotonicNs,
+                )
+            }
+        }
     }
 
     override suspend fun stopRecording(): StreamStopReport {
-        cameraFileURI = ble.stopRemoteRecording()
+        val stopResult = ble.stopRemoteRecordingReliably()
+        cameraFileURI = stopResult.cameraFileURI ?: Insta360PendingSidecar.unresolvedCameraFileURI
         val episodeDir = currentEpisodeDirectory
         val uri = cameraFileURI
         if (episodeDir != null && uri != null) {
@@ -85,10 +101,14 @@ class Insta360CameraStream(
                     episodeDir = episodeDir,
                     streamId = streamId,
                     cameraFileURI = uri,
-                    bleUuid = ble.connectedDeviceUuid.orEmpty(),
-                    bleName = ble.connectedDeviceName.orEmpty(),
+                    bleUuid = resolvedDeviceUuid(),
+                    bleName = resolvedDeviceName(),
                     role = roleFromStreamId(streamId),
                     bleAckNs = bleAckMonotonicNs,
+                    stopFailureReason = stopResult.diagnostic,
+                    bleAckWallClockMs = bleAckWallClockMs,
+                    stopWallClockMs = stopResult.stopWallClockMs,
+                    expectedSegments = 1,
                 )
             }
         }
@@ -104,11 +124,14 @@ class Insta360CameraStream(
 
         val (ssid, passphrase) = ble.wifiCredentials()
         val destination = File(episodeDirectory, "$streamId.mp4")
+        val sidecar = Insta360PendingSidecar.scan(episodeDirectory)
+            .firstOrNull { it.streamId == streamId }
         wifi.download(
             remoteFileURI = uri,
             destination = destination,
             ssid = ssid,
             passphrase = passphrase,
+            sidecar = sidecar,
             progress = progress,
         )
 
@@ -149,4 +172,10 @@ class Insta360CameraStream(
         streamId.endsWith("_right") -> "right"
         else -> ""
     }
+
+    private fun resolvedDeviceUuid(): String =
+        ble.connectedDeviceUuid ?: ble.lastKnownDeviceUUID ?: ""
+
+    private fun resolvedDeviceName(): String =
+        ble.connectedDeviceName ?: ble.lastKnownDeviceName ?: ""
 }
