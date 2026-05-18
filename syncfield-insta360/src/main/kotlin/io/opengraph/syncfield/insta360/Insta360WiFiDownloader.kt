@@ -3,6 +3,7 @@ package io.opengraph.syncfield.insta360
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -21,7 +22,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.HttpURLConnection
+import java.net.Socket
 import java.net.URL
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -59,14 +63,13 @@ internal object Insta360WiFiReachabilityPolicy {
  * platform constraint we can't bypass.
  *
  * Mirrors the iOS [Insta360WiFiDownloader.download] flow but uses the
- * Android NetworkRequest API and an HTTPS GET (the Insta360 OneSDK
- * Android variant exposes the camera's HTTP socket on the same
- * `192.168.42.1:6666` endpoint as the iOS SDK once we're routed through
- * the camera AP).
+ * Android NetworkRequest API. Reachability is verified with a raw TCP
+ * socket because the camera's HTTP root does not have to answer a GET
+ * even when the download socket is ready.
  */
 class Insta360WiFiDownloader(private val context: Context) {
 
-    private val cameraHost = "192.168.42.1"
+    private val defaultCameraHost = "192.168.42.1"
     private val cameraPort = 6666
 
     data class BatchItem(
@@ -102,15 +105,14 @@ class Insta360WiFiDownloader(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = applyNetworkSuggestion(cm, ssid, passphrase)
         try {
-            waitForReachability(cm)
+            val cameraHost = waitForReachability(cm)
             var written = 0L
             for ((uri, dst) in resolveRemoteDestinations(
-                cm = cm,
                 remoteFileURI = remoteFileURI,
                 destination = destination,
                 sidecar = sidecar,
             )) {
-                written += fetchResource(cm, uri, dst, progress)
+                written += fetchResource(cm, cameraHost, uri, dst, progress)
             }
             return written
         } finally {
@@ -130,18 +132,18 @@ class Insta360WiFiDownloader(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = applyNetworkSuggestion(cm, ssid, passphrase)
         return try {
-            waitForReachability(cm)
+            val cameraHost = waitForReachability(cm)
             items.map { item ->
                 runCatching {
                     onItemStart(item)
                     for ((uri, dst) in resolveRemoteDestinations(
-                        cm = cm,
                         remoteFileURI = item.remoteFileURI,
                         destination = item.destination,
                         sidecar = item.sidecar,
                     )) {
                         fetchResource(
                             cm = cm,
+                            cameraHost = cameraHost,
                             remoteFileURI = uri,
                             destination = dst,
                             progress = { progress(item, it) },
@@ -260,6 +262,13 @@ class Insta360WiFiDownloader(private val context: Context) {
             override fun onAvailable(network: Network) {
                 cm.bindProcessToNetwork(network)
                 runCatching { Insta360OneSDKBridge.bindNetwork(network) }
+                logNetworkSnapshot(
+                    cm = cm,
+                    network = network,
+                    ssid = ssid,
+                    attempt = attempt,
+                    event = "camera_ap_join_available_network",
+                )
                 InstaLog.log(
                     InstaLogCategory.WIFI,
                     event = "camera_ap_join_available",
@@ -270,6 +279,16 @@ class Insta360WiFiDownloader(private val context: Context) {
                     ),
                 )
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
+            }
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                logNetworkSnapshot(
+                    cm = cm,
+                    network = network,
+                    ssid = ssid,
+                    attempt = attempt,
+                    event = "camera_ap_link_properties",
+                    linkProperties = linkProperties,
+                )
             }
             override fun onUnavailable() {
                 logWifiScanSnapshot(
@@ -384,40 +403,129 @@ class Insta360WiFiDownloader(private val context: Context) {
         return visibleTarget
     }
 
-    private suspend fun waitForReachability(cm: ConnectivityManager) {
+    private suspend fun waitForReachability(cm: ConnectivityManager): String {
+        var lastCandidates = emptyList<String>()
         for ((index, delayMs) in Insta360WiFiReachabilityPolicy.probeDelaysMs.withIndex()) {
-            if (probeOnce(cm)) return
+            val candidates = cameraHostCandidates(cm)
+            lastCandidates = candidates
+            for (host in candidates) {
+                if (probeOnce(cm, host, index + 1)) return host
+            }
             if (index < Insta360WiFiReachabilityPolicy.probeDelaysMs.lastIndex) {
                 delay(delayMs)
             }
         }
-        throw Insta360Error.CameraNotReachable
+        throw Insta360Error.DownloadFailed(
+            "camera AP reachable timeout; tried ${lastCandidates.joinToString(",")}"
+        )
     }
 
-    private fun probeOnce(cm: ConnectivityManager): Boolean {
+    private fun probeOnce(cm: ConnectivityManager, host: String, attempt: Int): Boolean {
         return runCatching {
-            val url = URL("http://$cameraHost:$cameraPort/")
             val network = cm.boundNetworkForProcess
-            ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).run {
-                connectTimeout = 3_000
-                readTimeout = 3_000
-                requestMethod = "GET"
-                connect()
-                disconnect()
-                true
+            val socket = if (network != null) {
+                network.socketFactory.createSocket()
+            } else {
+                Socket()
             }
-        }.getOrDefault(false)
+            socket.use {
+                it.connect(InetSocketAddress(host, cameraPort), 3_000)
+            }
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                event = "camera_ap_probe_ok",
+                fields = mapOf(
+                    "host" to host,
+                    "port" to cameraPort,
+                    "attempt" to attempt,
+                    "network" to (network?.networkHandle ?: -1L),
+                ),
+            )
+            true
+        }.getOrElse { error ->
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.DEBUG,
+                event = "camera_ap_probe_failed",
+                fields = mapOf(
+                    "host" to host,
+                    "port" to cameraPort,
+                    "attempt" to attempt,
+                    "error" to (error.message ?: error::class.java.simpleName),
+                ),
+            )
+            false
+        }
+    }
+
+    private fun cameraHostCandidates(cm: ConnectivityManager): List<String> {
+        val network = cm.boundNetworkForProcess ?: cm.activeNetwork
+        val linkProperties = network?.let { cm.getLinkProperties(it) }
+        val gateways = linkProperties
+            ?.routes
+            ?.asSequence()
+            ?.mapNotNull { it.gateway as? Inet4Address }
+            ?.mapNotNull { it.hostAddress }
+            ?.filter { it.isNotBlank() && it != "0.0.0.0" }
+            ?.toList()
+            .orEmpty()
+        return (gateways + defaultCameraHost).distinct()
+    }
+
+    private fun logNetworkSnapshot(
+        cm: ConnectivityManager,
+        network: Network,
+        ssid: String,
+        attempt: Int,
+        event: String,
+        linkProperties: LinkProperties? = cm.getLinkProperties(network),
+    ) {
+        val caps = cm.getNetworkCapabilities(network)
+        val addresses = linkProperties
+            ?.linkAddresses
+            ?.map { "${it.address.hostAddress}/${it.prefixLength}" }
+            .orEmpty()
+        val routes = linkProperties
+            ?.routes
+            ?.map { route ->
+                val gateway = route.gateway?.hostAddress ?: ""
+                "${route.destination}->${gateway}"
+            }
+            .orEmpty()
+        val dns = linkProperties
+            ?.dnsServers
+            ?.mapNotNull { it.hostAddress }
+            .orEmpty()
+        InstaLog.log(
+            InstaLogCategory.WIFI,
+            event = event,
+            fields = mapOf(
+                "ssid" to ssid,
+                "attempt" to attempt,
+                "network" to network.networkHandle,
+                "interface" to (linkProperties?.interfaceName ?: ""),
+                "addresses" to addresses,
+                "routes" to routes,
+                "dns" to dns,
+                "host_candidates" to cameraHostCandidates(cm),
+                "has_internet" to (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false),
+                "validated" to (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false),
+                "captive_portal" to (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) ?: false),
+            ),
+        )
     }
 
     private fun fetchResource(
         cm: ConnectivityManager,
+        cameraHost: String,
         remoteFileURI: String,
         destination: File,
         progress: (Double) -> Unit,
     ): Long {
         destination.parentFile?.mkdirs()
 
-        val url = URL("http://$cameraHost:$cameraPort${normalizedCameraFileURI(remoteFileURI)}")
+        val cameraPath = normalizedCameraFileURI(remoteFileURI)
+        val url = URL("http://$cameraHost:$cameraPort$cameraPath")
         val network = cm.boundNetworkForProcess
         val conn = ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).apply {
             connectTimeout = 10_000
@@ -425,10 +533,40 @@ class Insta360WiFiDownloader(private val context: Context) {
             requestMethod = "GET"
         }
 
-        val total = conn.contentLengthLong.takeIf { it > 0 } ?: -1L
         var written = 0L
         try {
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                event = "download_fetch_requested",
+                fields = mapOf(
+                    "host" to cameraHost,
+                    "port" to cameraPort,
+                    "path" to cameraPath,
+                    "network" to (network?.networkHandle ?: -1L),
+                    "destination" to destination.absolutePath,
+                ),
+            )
             conn.connect()
+            val code = conn.responseCode
+            val total = conn.contentLengthLong.takeIf { it > 0 } ?: -1L
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                event = "download_fetch_response",
+                fields = mapOf(
+                    "host" to cameraHost,
+                    "path" to cameraPath,
+                    "status" to code,
+                    "content_length" to total,
+                ),
+            )
+            if (code !in 200..299) {
+                val body = runCatching {
+                    conn.errorStream?.bufferedReader()?.use { it.readText().take(512) }
+                }.getOrNull().orEmpty()
+                throw Insta360Error.DownloadFailed(
+                    "camera HTTP $code for $cameraPath${if (body.isBlank()) "" else ": $body"}"
+                )
+            }
             conn.inputStream.use { input ->
                 destination.outputStream().use { out ->
                     val buf = ByteArray(64 * 1024)
@@ -444,6 +582,16 @@ class Insta360WiFiDownloader(private val context: Context) {
                 }
             }
         } catch (t: Throwable) {
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "download_fetch_failed",
+                fields = mapOf(
+                    "host" to cameraHost,
+                    "path" to cameraPath,
+                    "error" to (t.message ?: t::class.java.simpleName),
+                ),
+            )
             throw Insta360Error.DownloadFailed(t.message ?: "unknown")
         } finally {
             conn.disconnect()
@@ -452,7 +600,6 @@ class Insta360WiFiDownloader(private val context: Context) {
     }
 
     private suspend fun resolveRemoteDestinations(
-        cm: ConnectivityManager,
         remoteFileURI: String,
         destination: File,
         sidecar: Insta360PendingSidecar?,
@@ -597,7 +744,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         val value = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
         return runCatching {
             val url = URL(value)
-            if (url.host == cameraHost && url.path.isNotBlank()) url.path else value
+            if (url.path.isNotBlank()) url.path else value
         }.getOrElse { value }
     }
 
