@@ -8,14 +8,15 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
+import android.os.SystemClock
 import androidx.annotation.RequiresApi
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.camera.callback.ICameraOperateCallback
 import io.opengraph.syncfield.insta360.logging.InstaLog
 import io.opengraph.syncfield.insta360.logging.InstaLogCategory
 import io.opengraph.syncfield.insta360.logging.InstaLogLevel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -26,6 +27,8 @@ import java.time.format.DateTimeFormatter
 
 internal object Insta360WiFiReachabilityPolicy {
     const val joinTimeoutMs: Long = 45_000L
+    const val joinAttemptTimeoutMs: Long = 15_000L
+    const val joinRetryDelayMs: Long = 2_000L
     const val joinAwaitSlackMs: Long = 2_000L
 
     val probeDelaysMs: List<Long> = listOf(
@@ -176,6 +179,61 @@ class Insta360WiFiDownloader(private val context: Context) {
         ssid: String,
         passphrase: String,
     ): ConnectivityManager.NetworkCallback {
+        val deadlineMs = SystemClock.elapsedRealtime() + Insta360WiFiReachabilityPolicy.joinTimeoutMs
+        var attempt = 1
+        var lastError: Throwable? = null
+        while (SystemClock.elapsedRealtime() < deadlineMs) {
+            val remainingMs = deadlineMs - SystemClock.elapsedRealtime()
+            val attemptTimeoutMs = minOf(
+                Insta360WiFiReachabilityPolicy.joinAttemptTimeoutMs,
+                remainingMs,
+            ).coerceAtLeast(1_000L)
+            try {
+                return requestCameraNetworkOnce(
+                    cm = cm,
+                    ssid = ssid,
+                    passphrase = passphrase,
+                    attempt = attempt,
+                    timeoutMs = attemptTimeoutMs,
+                )
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                lastError = t
+                val retryDelayMs = minOf(
+                    Insta360WiFiReachabilityPolicy.joinRetryDelayMs,
+                    deadlineMs - SystemClock.elapsedRealtime(),
+                )
+                if (retryDelayMs <= 0) break
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    level = InstaLogLevel.WARN,
+                    event = "camera_ap_join_retry",
+                    fields = mapOf(
+                        "ssid" to ssid,
+                        "attempt" to attempt,
+                        "retry_delay_ms" to retryDelayMs,
+                        "error" to (t.message ?: t::class.java.simpleName),
+                    ),
+                )
+                delay(retryDelayMs)
+                attempt += 1
+            }
+        }
+        throw Insta360Error.HotspotApplyFailed(
+            "camera AP unavailable for SSID=$ssid after ${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms" +
+                (lastError?.message?.let { " ($it)" } ?: "")
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private suspend fun requestCameraNetworkOnce(
+        cm: ConnectivityManager,
+        ssid: String,
+        passphrase: String,
+        attempt: Int,
+        timeoutMs: Long,
+    ): ConnectivityManager.NetworkCallback {
         val specifier = WifiNetworkSpecifier.Builder()
             .setSsid(ssid)
             .setWpa2Passphrase(passphrase)
@@ -197,6 +255,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     fields = mapOf(
                         "ssid" to ssid,
                         "network" to network.networkHandle,
+                        "attempt" to attempt,
                     ),
                 )
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
@@ -206,7 +265,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     InstaLogCategory.WIFI,
                     level = InstaLogLevel.WARN,
                     event = "camera_ap_join_unavailable",
-                    fields = mapOf("ssid" to ssid),
+                    fields = mapOf("ssid" to ssid, "attempt" to attempt),
                 )
                 if (!onAvailable.isCompleted) {
                     onAvailable.completeExceptionally(
@@ -220,21 +279,23 @@ class Insta360WiFiDownloader(private val context: Context) {
             event = "camera_ap_join_requested",
             fields = mapOf(
                 "ssid" to ssid,
-                "timeout_ms" to Insta360WiFiReachabilityPolicy.joinTimeoutMs,
+                "attempt" to attempt,
+                "timeout_ms" to timeoutMs,
             ),
         )
-        cm.requestNetwork(request, cb, Insta360WiFiReachabilityPolicy.joinTimeoutMs.toInt())
+        cm.requestNetwork(request, cb, timeoutMs.toInt())
         try {
             withTimeoutOrNull(
-                Insta360WiFiReachabilityPolicy.joinTimeoutMs +
+                timeoutMs +
                     Insta360WiFiReachabilityPolicy.joinAwaitSlackMs,
             ) { onAvailable.await() }
                 ?: throw Insta360Error.HotspotApplyFailed(
-                    "camera AP join timeout (${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms)")
-        } catch (t: TimeoutCancellationException) {
-            throw Insta360Error.HotspotApplyFailed(
-                "camera AP join timeout (${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms)")
+                    "camera AP join timeout (${timeoutMs}ms)")
+        } catch (t: CancellationException) {
+            runCatching { cm.unregisterNetworkCallback(cb) }
+            throw t
         } catch (t: Throwable) {
+            runCatching { cm.unregisterNetworkCallback(cb) }
             if (t is Insta360Error) throw t
             throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown")
         }

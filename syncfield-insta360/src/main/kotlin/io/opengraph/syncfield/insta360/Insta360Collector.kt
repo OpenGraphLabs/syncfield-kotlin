@@ -117,8 +117,8 @@ object Insta360Collector {
         preferredName: String? = null,
     ): List<Insta360FileInfo> {
         val controller = Insta360BluetoothHub.pair(context, uuid)
-        val (ssid, passphrase) = controller.wifiCredentials()
         enableCameraWifiForDownload(controller, uuid)
+        val (ssid, passphrase) = controller.wifiCredentials()
         return Insta360ConnectionCoordinator.withWiFi(uuid) {
             Insta360WiFiDownloader(context).listFiles(ssid, passphrase)
         }
@@ -251,6 +251,8 @@ object Insta360Collector {
                     continue
                 }
 
+                enableCameraWifiForDownload(controller, uuid)
+
                 // Acquire WiFi credentials
                 val credsResult = runCatching { controller.wifiCredentials() }
                 if (credsResult.isFailure) {
@@ -262,7 +264,6 @@ object Insta360Collector {
                     continue
                 }
                 val (ssid, passphrase) = credsResult.getOrThrow()
-                enableCameraWifiForDownload(controller, uuid)
 
                 for (p in list) {
                     progress(Progress(p.episodeDir, p.sidecar.streamId, uuid, p.sidecar.role, "pairing", 0.0, ssid = ssid))

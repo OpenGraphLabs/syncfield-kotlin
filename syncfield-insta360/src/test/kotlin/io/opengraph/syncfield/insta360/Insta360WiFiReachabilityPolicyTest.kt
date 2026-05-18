@@ -15,6 +15,9 @@ class Insta360WiFiReachabilityPolicyTest {
     @Test
     fun `camera ap join timeout allows android approval and ap boot window`() {
         assertThat(Insta360WiFiReachabilityPolicy.joinTimeoutMs).isAtLeast(45_000L)
+        assertThat(Insta360WiFiReachabilityPolicy.joinAttemptTimeoutMs)
+            .isLessThan(Insta360WiFiReachabilityPolicy.joinTimeoutMs)
+        assertThat(Insta360WiFiReachabilityPolicy.joinRetryDelayMs).isAtLeast(1_000L)
         assertThat(Insta360WiFiReachabilityPolicy.joinAwaitSlackMs).isAtLeast(1_000L)
     }
 }

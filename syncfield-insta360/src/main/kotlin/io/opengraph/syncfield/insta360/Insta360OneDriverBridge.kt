@@ -6,6 +6,7 @@ import com.arashivision.ble.OneBleIOCallbacks
 import com.arashivision.camera.RequestOptions
 import com.arashivision.onecamera.OneDriver
 import com.arashivision.onecamera.OneDriverInfo
+import com.arashivision.onecamera.Options
 import com.arashivision.onecamera.camerarequest.TakePicture
 import com.arashivision.onecamera.cameraresponse.OpenCameraWifiResp
 import com.arashivision.onecamera.cameraresponse.StreamData
@@ -27,6 +28,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -411,12 +413,85 @@ internal class Insta360OneDriverBridge private constructor(
     /**
      * Ask the camera to bring up its own Wi-Fi AP before Android requests
      * the `GO 3S ... .OSC` network. This mirrors iOS'
-     * `enableWiFiForDownload`; without this preflight Android races the
-     * system network request against an AP that is not yet advertising and
-     * `ConnectivityManager` reports `onUnavailable`.
+     * `enableWiFiForDownload`, which sets `wifiStatus = ON`; without this
+     * preflight Android races the system network request against an AP that
+     * is not yet advertising and `ConnectivityManager` reports
+     * `onUnavailable`.
      */
-    suspend fun enableWifiForDownload(timeoutMs: Long = 8_000L) {
+    suspend fun enableWifiForDownload(timeoutMs: Long = 10_000L) {
         if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
+        val setOptionsState = setWifiStatusOn(timeoutMs)
+        if (setOptionsState == WifiEnableState.Confirmed || setOptionsState == WifiEnableState.Sent) {
+            delay(WIFI_AP_SETTLE_DELAY_MS)
+            return
+        }
+        openCameraWifiHint(timeoutMs = 6_000L)
+        delay(WIFI_AP_SETTLE_DELAY_MS)
+    }
+
+    private suspend fun setWifiStatusOn(timeoutMs: Long): WifiEnableState {
+        val ack = CompletableDeferred<Int>()
+        val collector = bridgeScope.launch {
+            infoNotifications
+                .filter { it.what == OneDriverInfo.Response.InfoType.SET_OPTIONS }
+                .collect { event ->
+                    if (!ack.isCompleted) ack.complete(event.err)
+                }
+        }
+        val options = Options()
+        try {
+            options.setWifiStatus(OneDriverInfo.Options.WifiStatus.ON)
+            val requestOptions = RequestOptions().apply { this.timeoutMs = timeoutMs.toInt() }
+            val requestId = oneDriver.setOptionsAsync(options, requestOptions)
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "onedriver_set_wifi_status_sent",
+                fields = mapOf("requestId" to requestId, "status" to "ON"),
+            )
+            if (requestId < 0) {
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    level = InstaLogLevel.WARN,
+                    event = "onedriver_set_wifi_status_rejected",
+                    fields = mapOf("requestId" to requestId),
+                )
+                return WifiEnableState.NotSent
+            }
+            val code = withTimeoutOrNull(timeoutMs) { ack.await() }
+            return when {
+                code == null -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "onedriver_set_wifi_status_timeout_continue",
+                        fields = mapOf("timeout_ms" to timeoutMs),
+                    )
+                    WifiEnableState.Sent
+                }
+                code == 0 -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        event = "onedriver_set_wifi_status_ok",
+                    )
+                    WifiEnableState.Confirmed
+                }
+                else -> {
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "onedriver_set_wifi_status_failed",
+                        fields = mapOf("code" to code),
+                    )
+                    WifiEnableState.NotSent
+                }
+            }
+        } finally {
+            collector.cancel()
+            runCatching { options.release() }
+        }
+    }
+
+    private suspend fun openCameraWifiHint(timeoutMs: Long) {
         val ack = CompletableDeferred<Int>()
         val collector = bridgeScope.launch {
             infoNotifications
@@ -502,12 +577,19 @@ internal class Insta360OneDriverBridge private constructor(
         // pick values well above the SDK's namespace to avoid clashes.
         private const val STILL_IMAGE_WHAT: Int = 1_000_001
         private const val RECORD_VIDEO_STATE_WHAT: Int = 1_000_002
+        private const val WIFI_AP_SETTLE_DELAY_MS: Long = 1_500L
 
         fun attach(
             context: Context,
             session: Insta360BleProtocolSession,
         ): Insta360OneDriverBridge = Insta360OneDriverBridge(context, session)
     }
+}
+
+private enum class WifiEnableState {
+    NotSent,
+    Sent,
+    Confirmed,
 }
 
 internal object Insta360RecordState {

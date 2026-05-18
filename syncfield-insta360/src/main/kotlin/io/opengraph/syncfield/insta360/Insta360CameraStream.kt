@@ -125,7 +125,6 @@ class Insta360CameraStream(
         val uri = cameraFileURI ?: throw Insta360Error.DownloadFailed(
             "no camera file uri recorded from stopRecording")
 
-        val (ssid, passphrase) = ble.wifiCredentials()
         runCatching { ble.enableWiFiForDownload() }
             .onFailure { t ->
                 InstaLog.log(
@@ -138,6 +137,7 @@ class Insta360CameraStream(
                     ),
                 )
             }
+        val (ssid, passphrase) = ble.wifiCredentials()
         val destination = File(episodeDirectory, "$streamId.mp4")
         val sidecar = Insta360PendingSidecar.scan(episodeDirectory)
             .firstOrNull { it.streamId == streamId }
