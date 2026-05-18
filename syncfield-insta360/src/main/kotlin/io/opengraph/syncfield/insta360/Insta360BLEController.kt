@@ -31,6 +31,55 @@ data class Insta360StopCaptureResult(
     val stopWallClockMs: Long? = null,
 )
 
+internal data class Insta360ResolvedWifiCredentials(
+    val ssid: String,
+    val password: String,
+    val ssidSource: String,
+    val passwordSource: String,
+)
+
+internal const val INSTA360_DEFAULT_WIFI_PASSWORD = "88888888"
+
+internal fun deriveInsta360Ssid(deviceName: String?, stableId: String?): String {
+    val base = deviceName.normalizedSsidOrNull()
+        ?: stableId.normalizedSsidOrNull()
+        ?: return ""
+    return if (base.endsWith(".OSC")) base else "$base.OSC"
+}
+
+internal fun resolveInsta360WifiCredentials(
+    deviceName: String?,
+    stableId: String?,
+    sdkSsid: String?,
+    sdkPassword: String?,
+): Insta360ResolvedWifiCredentials {
+    val derivedSsid = deriveInsta360Ssid(deviceName, stableId).takeIf { it.isNotBlank() }
+    val normalizedSdkSsid = sdkSsid.normalizedSsidOrNull()
+    val ssid = derivedSsid ?: normalizedSdkSsid ?: ""
+    val ssidSource = when {
+        derivedSsid != null -> "derived"
+        normalizedSdkSsid != null -> "sdk"
+        else -> "missing"
+    }
+    val sdkSsidMatchesDevice = normalizedSdkSsid == null || normalizedSdkSsid == ssid || derivedSsid == null
+    val normalizedSdkPassword = sdkPassword?.trim()?.takeIf { it.isNotBlank() }
+    val password = if (sdkSsidMatchesDevice) {
+        normalizedSdkPassword ?: INSTA360_DEFAULT_WIFI_PASSWORD
+    } else {
+        INSTA360_DEFAULT_WIFI_PASSWORD
+    }
+    val passwordSource = if (sdkSsidMatchesDevice && normalizedSdkPassword != null) "sdk" else "default"
+    return Insta360ResolvedWifiCredentials(
+        ssid = ssid,
+        password = password,
+        ssidSource = ssidSource,
+        passwordSource = passwordSource,
+    )
+}
+
+private fun String?.normalizedSsidOrNull(): String? =
+    this?.trim()?.removeSurrounding("\"")?.takeIf { it.isNotBlank() }
+
 /**
  * BLE controller for a single Insta360 Go 3S camera.
  *
@@ -261,24 +310,41 @@ class Insta360BLEController(
     }
 
     /**
-     * Retrieve the camera AP's WiFi SSID and passphrase. Strategy
-     * mirrors the Swift implementation:
-     * 1. Read cached `device.wifiInfo`.
-     * 2. Fall back to `getOptionsWithTypes` over BLE.
-     * 3. Final fallback: derive SSID from BLE name + default `88888888`.
+     * Retrieve the camera AP's WiFi SSID and passphrase without changing the
+     * live BLE/OneDriver session. Upload calls this immediately after
+     * [enableWiFiForDownload]; reconnecting here closes the session that just
+     * enabled the AP and can make Android miss the camera network.
      */
     suspend fun wifiCredentials(): Pair<String, String> {
         setup()
         val device = requireDevice()
-        return commandQueue.runDeviceCommand(commandId(device), timeoutMs = 30_000L, retries = 1) {
-            connectDeviceWithRetry(device)
-            runCatching { fetchCameraOptions() }
-            val wifi = manager.wifiInfo
-            val ssid = wifi?.ssid?.takeIf { it.isNotBlank() }
-                ?: derivedSsid(device)
-            val password = wifi?.pwd?.takeIf { it.isNotBlank() } ?: DEFAULT_WIFI_PASSWORD
+        return commandQueue.runDeviceCommand(
+            commandId(device),
+            timeoutMs = 5_000L,
+            retries = 0,
+            sdkCritical = false,
+        ) {
+            val stableId = Insta360OneSDKBridge.stableId(device)
+            val wifi = runCatching { manager.wifiInfo }.getOrNull()
+            val resolved = resolveInsta360WifiCredentials(
+                deviceName = device.name,
+                stableId = stableId,
+                sdkSsid = wifi?.ssid,
+                sdkPassword = wifi?.pwd,
+            )
+            val ssid = resolved.ssid
             if (ssid.isBlank()) throw Insta360Error.WifiCredentialsUnavailable
-            ssid to password
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "wifi_credentials_resolved",
+                fields = mapOf(
+                    "ssid" to ssid,
+                    "ssid_source" to resolved.ssidSource,
+                    "password_source" to resolved.passwordSource,
+                    "preserved_session" to true,
+                ),
+            )
+            ssid to resolved.password
         }
     }
 
@@ -835,21 +901,11 @@ class Insta360BLEController(
         if (!device.name.isNullOrEmpty()) lastKnownDeviceName = device.name
     }
 
-    private fun derivedSsid(device: BleDevice): String {
-        val name = device.name?.takeIf { it.isNotBlank() }
-            ?: Insta360OneSDKBridge.stableId(device)
-        return if (name.endsWith(".OSC")) name else "$name.OSC"
-    }
-
     private fun commandId(device: BleDevice?): String =
         device?.let { Insta360OneSDKBridge.stableId(it) }
             ?: connectedDeviceUuid
             ?: lastKnownDeviceUUID
             ?: "unpaired-${System.identityHashCode(this)}"
-
-    companion object {
-        private const val DEFAULT_WIFI_PASSWORD = "88888888"
-    }
 }
 
 /**
