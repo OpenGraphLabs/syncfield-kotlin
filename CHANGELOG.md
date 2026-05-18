@@ -71,6 +71,11 @@ work. All additions are additive over v0.4.0; no public API removed.
 - Removed reflection scaffolds. Direct imports of `InstaCameraManager` (com.arashivision.sdk:sdkcamera 1.10.1).
 - `Insta360OneSDKBridge.available` kept as `Class.forName` capability flag (Proguard strip safety).
 
+### Fixed
+
+- Android GO 3S collect now completes media ingestion end-to-end: BLE opens camera Wi-Fi and file-access mode, Android joins the camera AP, socket probing still targets `192.168.42.1:6666`, and MP4 transfer uses the camera HTTP server on port 80.
+- Multi-camera collect reports OneDriver download progress (`DOWNLOADING` then `SUCCESS`/`FAIL`) and restores file-access state after each transfer.
+
 ## [0.4.0] — 2026-05-11
 
 ### Added

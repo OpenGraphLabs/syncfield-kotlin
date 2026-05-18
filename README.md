@@ -6,15 +6,11 @@ IMU, FSR gloves, and Insta360 cameras share a single host clock and
 produce a common on-disk layout that the syncfield Python pipeline
 ingests.
 
-> **Status — v0.5.0-preview.** The Insta360 module reaches feature parity
-> with `syncfield-swift` v0.9.x (per-camera supervisor, radio gate,
-> connection coordinator, multi-camera collector, identity store,
-> background lifecycle). 135 unit tests, 0 failures.
->
-> Pairing reliability on Android is still being stabilized vs. iOS, so
-> this preview is intended for **integration / interface review**, not
-> production use. A stable `v0.5.0` will follow once the BLE pair /
-> reconnect path is fully tuned.
+> **Status — v0.5.0.** The Insta360 module reaches feature parity with
+> `syncfield-swift` v0.9.x (per-camera supervisor, radio gate, connection
+> coordinator, multi-camera collector, identity store, background lifecycle)
+> and has been validated against Android GO 3S dual-wrist recording,
+> Wi-Fi collect, and file ingestion.
 
 ## Modules
 
@@ -136,11 +132,11 @@ Then depend on the modules the host app needs:
 
 ```kotlin
 dependencies {
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-core:v0.5.0-preview")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-streams:v0.5.0-preview")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-tactile:v0.5.0-preview")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-insta360:v0.5.0-preview")
-    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-ui:v0.5.0-preview")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-core:v0.5.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-streams:v0.5.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-tactile:v0.5.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-insta360:v0.5.0")
+    implementation("com.github.OpenGraphLabs.syncfield-kotlin:syncfield-ui:v0.5.0")
 }
 ```
 
