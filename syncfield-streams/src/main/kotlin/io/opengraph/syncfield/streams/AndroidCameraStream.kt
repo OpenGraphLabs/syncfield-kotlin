@@ -255,7 +255,9 @@ class AndroidCameraStream @JvmOverloads constructor(
         val previewBuilder = Preview.Builder()
             .setResolutionSelector(captureResolutionSelector)
         rotations.preview?.let { previewBuilder.setTargetRotation(it) }
-        pinnedPhysicalId?.let { Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(it) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pinnedPhysicalId?.let { Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(it) }
+        }
         preview = previewBuilder.build().also { builtPreview ->
             previewSurfaceProvider?.let { builtPreview.setSurfaceProvider(it) }
         }
@@ -274,8 +276,10 @@ class AndroidCameraStream @JvmOverloads constructor(
         // and doesn't expose the builder chain.
         @SuppressLint("RestrictedApi")
         val videoCaptureBuilder = VideoCapture.Builder(recorder)
-        pinnedPhysicalId?.let {
-            Camera2Interop.Extender(videoCaptureBuilder).setPhysicalCameraId(it)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pinnedPhysicalId?.let {
+                Camera2Interop.Extender(videoCaptureBuilder).setPhysicalCameraId(it)
+            }
         }
         videoCapture = videoCaptureBuilder.build().also {
             it.targetRotation = rotations.videoCapture
@@ -286,8 +290,10 @@ class AndroidCameraStream @JvmOverloads constructor(
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setResolutionSelector(analysisResolutionSelector)
             .setTargetRotation(rotations.imageAnalysis)
-        pinnedPhysicalId?.let {
-            Camera2Interop.Extender(imageAnalysisBuilder).setPhysicalCameraId(it)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pinnedPhysicalId?.let {
+                Camera2Interop.Extender(imageAnalysisBuilder).setPhysicalCameraId(it)
+            }
         }
         imageAnalysis = imageAnalysisBuilder.build()
             .also { ia ->
@@ -415,12 +421,10 @@ class AndroidCameraStream @JvmOverloads constructor(
             candidateFromCharacteristics(topId, owningLogicalId = null, chars = chars)
                 ?.also { candidates.add(it); logCandidate(it) }
 
-            // Sub-physical IDs are only exposed on API 28+. The
-            // characteristics getter for a sub-physical is on the
-            // CameraManager itself (added in API 29 — earlier devices
-            // can't query the hidden physicals at all).
+            // Sub-physical IDs are exposed on API 28+, but querying hidden
+            // physical camera characteristics is reliable from API 29.
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) continue
-            val physicalIds = runCatching { chars.physicalCameraIds }.getOrDefault(emptySet())
+            val physicalIds = physicalCameraIds(chars)
             for (physId in physicalIds) {
                 if (physId in topLevelIdSet) continue // also seen as a top-level entry
                 val physChars = runCatching {
@@ -431,6 +435,12 @@ class AndroidCameraStream @JvmOverloads constructor(
             }
         }
         return candidates
+    }
+
+    @SuppressLint("NewApi")
+    private fun physicalCameraIds(chars: CameraCharacteristics): Set<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return emptySet()
+        return runCatching { chars.physicalCameraIds }.getOrDefault(emptySet())
     }
 
     private fun candidateFromCharacteristics(
