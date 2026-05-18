@@ -12,6 +12,8 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.SystemClock
 import androidx.annotation.RequiresApi
+import com.arashivision.insta360.basecamera.camera.BaseCamera
+import com.arashivision.insta360.basecamera.camera.CameraManager
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.camera.callback.ICameraChangedCallback
 import io.opengraph.syncfield.insta360.logging.InstaLog
@@ -75,6 +77,11 @@ class Insta360WiFiDownloader(private val context: Context) {
 
     private val defaultCameraHost = "192.168.42.1"
     private val cameraPort = 6666
+    private val sdkWifiDownloadSetupDelayMs = 300L
+
+    // com.arashivision.onecamera.OneDriverInfo.Request.AccessCameraFileState
+    private val cameraFileAccessStateIdle = 1
+    private val cameraFileAccessStateDownload = 3
 
     data class BatchItem(
         val episodeDir: File,
@@ -89,6 +96,13 @@ class Insta360WiFiDownloader(private val context: Context) {
         val item: BatchItem,
         val success: Boolean,
         val error: String? = null,
+    )
+
+    private data class DownloadEndpoint(
+        val host: String,
+        val port: Int,
+        val path: String,
+        val sdkHttpPrefix: String,
     )
 
     /**
@@ -519,7 +533,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         )
     }
 
-    private fun fetchResource(
+    private suspend fun fetchResource(
         cm: ConnectivityManager,
         cameraHost: String,
         remoteFileURI: String,
@@ -529,29 +543,39 @@ class Insta360WiFiDownloader(private val context: Context) {
         destination.parentFile?.mkdirs()
 
         val cameraPath = normalizedCameraFileURI(remoteFileURI)
-        val network = cm.boundNetworkForProcess
-        val socket = network?.socketFactory?.createSocket() ?: Socket()
+        var socket: Socket? = null
+        var endpoint = DownloadEndpoint(cameraHost, cameraPort, cameraPath, "")
+        var accessStateSet = false
 
         var written = 0L
         try {
+            ensureSdkWifiCameraOpen(timeoutMs = 12_000L)
+            setCameraFileAccessState(cameraFileAccessStateDownload)
+            accessStateSet = true
+            delay(sdkWifiDownloadSetupDelayMs)
+
+            endpoint = resolveDownloadEndpoint(cameraHost, cameraPath)
+            val network = cm.boundNetworkForProcess
+            socket = network?.socketFactory?.createSocket() ?: Socket()
             InstaLog.log(
                 InstaLogCategory.WIFI,
                 event = "download_fetch_requested",
                 fields = mapOf(
-                    "host" to cameraHost,
-                    "port" to cameraPort,
-                    "path" to cameraPath,
+                    "host" to endpoint.host,
+                    "port" to endpoint.port,
+                    "path" to endpoint.path,
                     "network" to (network?.networkHandle ?: -1L),
                     "destination" to destination.absolutePath,
-                    "transport" to "raw_socket",
+                    "transport" to "raw_socket_sdk_session",
+                    "sdk_http_prefix" to endpoint.sdkHttpPrefix,
                 ),
             )
             socket.soTimeout = 30_000
-            socket.connect(InetSocketAddress(cameraHost, cameraPort), 10_000)
+            socket.connect(InetSocketAddress(endpoint.host, endpoint.port), 10_000)
 
             val request = buildString {
-                append("GET ").append(cameraPath).append(" HTTP/1.1\r\n")
-                append("Host: ").append(cameraHost).append(':').append(cameraPort).append("\r\n")
+                append("GET ").append(endpoint.path).append(" HTTP/1.1\r\n")
+                append("Host: ").append(endpoint.host).append(':').append(endpoint.port).append("\r\n")
                 append("Accept: */*\r\n")
                 append("Connection: close\r\n")
                 append("\r\n")
@@ -570,18 +594,18 @@ class Insta360WiFiDownloader(private val context: Context) {
                 InstaLogCategory.WIFI,
                 event = "download_fetch_response",
                 fields = mapOf(
-                    "host" to cameraHost,
-                    "path" to cameraPath,
+                    "host" to endpoint.host,
+                    "path" to endpoint.path,
                     "status" to code,
                     "content_length" to total,
                     "chunked" to chunked,
-                    "transport" to "raw_socket",
+                    "transport" to "raw_socket_sdk_session",
                 ),
             )
             if (code !in 200..299) {
                 val body = readBodyPreview(input, chunked)
                 throw Insta360Error.DownloadFailed(
-                    "camera HTTP $code for $cameraPath${if (body.isBlank()) "" else ": $body"}"
+                    "camera HTTP $code for ${endpoint.path}${if (body.isBlank()) "" else ": $body"}"
                 )
             }
 
@@ -600,16 +624,63 @@ class Insta360WiFiDownloader(private val context: Context) {
                 level = InstaLogLevel.WARN,
                 event = "download_fetch_failed",
                 fields = mapOf(
-                    "host" to cameraHost,
-                    "path" to cameraPath,
+                    "host" to endpoint.host,
+                    "port" to endpoint.port,
+                    "path" to endpoint.path,
                     "error" to (t.message ?: t::class.java.simpleName),
                 ),
             )
             throw Insta360Error.DownloadFailed(t.message ?: "unknown")
         } finally {
-            runCatching { socket.close() }
+            runCatching { socket?.close() }
+            if (accessStateSet) {
+                setCameraFileAccessState(cameraFileAccessStateIdle)
+            }
+            closeSdkWifiCamera()
         }
         return written
+    }
+
+    private fun resolveDownloadEndpoint(cameraHost: String, cameraPath: String): DownloadEndpoint {
+        val sdkHttpPrefix = runCatching {
+            Insta360OneSDKBridge.manager.getCameraHttpPrefix().trim()
+        }.getOrDefault("")
+        if (sdkHttpPrefix.isBlank()) {
+            return DownloadEndpoint(cameraHost, cameraPort, cameraPath, sdkHttpPrefix)
+        }
+
+        val candidate = if (
+            sdkHttpPrefix.startsWith("http://", ignoreCase = true) ||
+            sdkHttpPrefix.startsWith("https://", ignoreCase = true)
+        ) {
+            sdkHttpPrefix
+        } else {
+            "http://$sdkHttpPrefix"
+        }
+        return runCatching {
+            val url = URL(candidate)
+            DownloadEndpoint(
+                host = url.host.takeIf { it.isNotBlank() } ?: cameraHost,
+                port = when {
+                    url.port > 0 -> url.port
+                    url.defaultPort > 0 -> url.defaultPort
+                    else -> cameraPort
+                },
+                path = cameraPath,
+                sdkHttpPrefix = sdkHttpPrefix,
+            )
+        }.getOrElse { error ->
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "sdk_http_prefix_parse_failed",
+                fields = mapOf(
+                    "sdk_http_prefix" to sdkHttpPrefix,
+                    "error" to (error.message ?: error::class.java.simpleName),
+                ),
+            )
+            DownloadEndpoint(cameraHost, cameraPort, cameraPath, sdkHttpPrefix)
+        }
     }
 
     private fun readHttpHeaders(input: BufferedInputStream): Map<String, String> {
@@ -860,6 +931,41 @@ class Insta360WiFiDownloader(private val context: Context) {
                 Insta360OneSDKBridge.manager.closeCamera()
                 InstaLog.log(InstaLogCategory.WIFI, event = "sdk_wifi_camera_closed")
             }
+        }
+    }
+
+    private fun setCameraFileAccessState(state: Int) {
+        val camera = runCatching {
+            CameraManager.getInstance().getReadyCameraByConnectType(BaseCamera.ConnectType.WIFI)
+                ?: CameraManager.getInstance().getCameraByConnectType(BaseCamera.ConnectType.WIFI)
+        }.getOrNull()
+        if (camera == null) {
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "camera_file_access_state_skipped",
+                fields = mapOf("state" to state),
+            )
+            return
+        }
+
+        runCatching {
+            camera.setAccessCameraFileState(state)
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                event = "camera_file_access_state_set",
+                fields = mapOf("state" to state),
+            )
+        }.getOrElse { error ->
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "camera_file_access_state_failed",
+                fields = mapOf(
+                    "state" to state,
+                    "error" to (error.message ?: error::class.java.simpleName),
+                ),
+            )
         }
     }
 
