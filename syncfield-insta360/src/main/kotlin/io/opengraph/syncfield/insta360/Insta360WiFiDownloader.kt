@@ -21,12 +21,16 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.InetSocketAddress
-import java.net.HttpURLConnection
 import java.net.Socket
 import java.net.URL
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 
@@ -525,13 +529,8 @@ class Insta360WiFiDownloader(private val context: Context) {
         destination.parentFile?.mkdirs()
 
         val cameraPath = normalizedCameraFileURI(remoteFileURI)
-        val url = URL("http://$cameraHost:$cameraPort$cameraPath")
         val network = cm.boundNetworkForProcess
-        val conn = ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).apply {
-            connectTimeout = 10_000
-            readTimeout = 30_000
-            requestMethod = "GET"
-        }
+        val socket = network?.socketFactory?.createSocket() ?: Socket()
 
         var written = 0L
         try {
@@ -544,11 +543,29 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "path" to cameraPath,
                     "network" to (network?.networkHandle ?: -1L),
                     "destination" to destination.absolutePath,
+                    "transport" to "raw_socket",
                 ),
             )
-            conn.connect()
-            val code = conn.responseCode
-            val total = conn.contentLengthLong.takeIf { it > 0 } ?: -1L
+            socket.soTimeout = 30_000
+            socket.connect(InetSocketAddress(cameraHost, cameraPort), 10_000)
+
+            val request = buildString {
+                append("GET ").append(cameraPath).append(" HTTP/1.1\r\n")
+                append("Host: ").append(cameraHost).append(':').append(cameraPort).append("\r\n")
+                append("Accept: */*\r\n")
+                append("Connection: close\r\n")
+                append("\r\n")
+            }
+            val socketOut = socket.getOutputStream()
+            socketOut.write(request.toByteArray(StandardCharsets.US_ASCII))
+            socketOut.flush()
+
+            val input = BufferedInputStream(socket.getInputStream(), 64 * 1024)
+            val statusLine = readHttpLine(input)
+            val code = parseHttpStatusCode(statusLine)
+            val headers = readHttpHeaders(input)
+            val total = headers["content-length"]?.toLongOrNull()?.takeIf { it > 0 } ?: -1L
+            val chunked = headers["transfer-encoding"]?.lowercase()?.contains("chunked") == true
             InstaLog.log(
                 InstaLogCategory.WIFI,
                 event = "download_fetch_response",
@@ -557,31 +574,27 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "path" to cameraPath,
                     "status" to code,
                     "content_length" to total,
+                    "chunked" to chunked,
+                    "transport" to "raw_socket",
                 ),
             )
             if (code !in 200..299) {
-                val body = runCatching {
-                    conn.errorStream?.bufferedReader()?.use { it.readText().take(512) }
-                }.getOrNull().orEmpty()
+                val body = readBodyPreview(input, chunked)
                 throw Insta360Error.DownloadFailed(
                     "camera HTTP $code for $cameraPath${if (body.isBlank()) "" else ": $body"}"
                 )
             }
-            conn.inputStream.use { input ->
-                destination.outputStream().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        written += n
-                        if (total > 0) {
-                            progress((written.toDouble() / total).coerceIn(0.0, 1.0))
-                        }
-                    }
+
+            destination.outputStream().use { out ->
+                written = if (chunked) {
+                    copyChunkedHttpBody(input, out)
+                } else {
+                    copyHttpBody(input, out, total, progress)
                 }
+                progress(1.0)
             }
         } catch (t: Throwable) {
+            runCatching { destination.delete() }
             InstaLog.log(
                 InstaLogCategory.WIFI,
                 level = InstaLogLevel.WARN,
@@ -594,9 +607,135 @@ class Insta360WiFiDownloader(private val context: Context) {
             )
             throw Insta360Error.DownloadFailed(t.message ?: "unknown")
         } finally {
-            conn.disconnect()
+            runCatching { socket.close() }
         }
         return written
+    }
+
+    private fun readHttpHeaders(input: BufferedInputStream): Map<String, String> {
+        val headers = linkedMapOf<String, String>()
+        while (true) {
+            val line = readHttpLine(input)
+            if (line.isEmpty()) return headers
+            val colon = line.indexOf(':')
+            if (colon > 0) {
+                headers[line.substring(0, colon).trim().lowercase()] =
+                    line.substring(colon + 1).trim()
+            }
+        }
+    }
+
+    private fun readHttpLine(input: BufferedInputStream, maxBytes: Int = 16 * 1024): String {
+        val buffer = ByteArrayOutputStream()
+        while (true) {
+            val value = input.read()
+            if (value < 0) {
+                if (buffer.size() == 0) {
+                    throw Insta360Error.DownloadFailed("camera HTTP response ended before headers")
+                }
+                break
+            }
+            if (value == '\n'.code) break
+            if (value != '\r'.code) buffer.write(value)
+            if (buffer.size() > maxBytes) {
+                throw Insta360Error.DownloadFailed("camera HTTP header too large")
+            }
+        }
+        return buffer.toString(StandardCharsets.ISO_8859_1.name())
+    }
+
+    private fun parseHttpStatusCode(statusLine: String): Int {
+        val parts = statusLine.split(' ', limit = 3)
+        if (parts.size < 2 || !parts[0].startsWith("HTTP/", ignoreCase = true)) {
+            throw Insta360Error.DownloadFailed("camera returned invalid HTTP status: $statusLine")
+        }
+        return parts[1].toIntOrNull()
+            ?: throw Insta360Error.DownloadFailed("camera returned invalid HTTP status: $statusLine")
+    }
+
+    private fun copyHttpBody(
+        input: InputStream,
+        output: OutputStream,
+        contentLength: Long,
+        progress: (Double) -> Unit,
+    ): Long {
+        val buffer = ByteArray(64 * 1024)
+        var written = 0L
+        if (contentLength > 0) {
+            var remaining = contentLength
+            while (remaining > 0) {
+                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                if (n < 0) {
+                    throw Insta360Error.DownloadFailed(
+                        "camera HTTP body ended early ($written/$contentLength bytes)"
+                    )
+                }
+                output.write(buffer, 0, n)
+                written += n
+                remaining -= n
+                progress((written.toDouble() / contentLength).coerceIn(0.0, 1.0))
+            }
+            return written
+        }
+
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) return written
+            output.write(buffer, 0, n)
+            written += n
+        }
+    }
+
+    private fun copyChunkedHttpBody(input: BufferedInputStream, output: OutputStream): Long {
+        val buffer = ByteArray(64 * 1024)
+        var written = 0L
+        while (true) {
+            val sizeLine = readHttpLine(input).substringBefore(';').trim()
+            val chunkSize = sizeLine.toIntOrNull(radix = 16)
+                ?: throw Insta360Error.DownloadFailed("camera returned invalid chunk size: $sizeLine")
+            if (chunkSize == 0) {
+                while (readHttpLine(input).isNotEmpty()) {
+                    // Drain trailers.
+                }
+                return written
+            }
+
+            var remaining = chunkSize
+            while (remaining > 0) {
+                val n = input.read(buffer, 0, minOf(buffer.size, remaining))
+                if (n < 0) {
+                    throw Insta360Error.DownloadFailed("camera chunk ended early")
+                }
+                output.write(buffer, 0, n)
+                written += n
+                remaining -= n
+            }
+            readChunkTerminator(input)
+        }
+    }
+
+    private fun readChunkTerminator(input: InputStream) {
+        val first = input.read()
+        if (first == '\n'.code) return
+        if (first == '\r'.code) {
+            val second = input.read()
+            if (second == '\n'.code) return
+        }
+        throw Insta360Error.DownloadFailed("camera returned invalid chunk terminator")
+    }
+
+    private fun readBodyPreview(input: BufferedInputStream, chunked: Boolean): String {
+        return runCatching {
+            val buffer = ByteArray(512)
+            val size = if (chunked) {
+                val sizeLine = readHttpLine(input).substringBefore(';').trim()
+                minOf(sizeLine.toIntOrNull(radix = 16) ?: 0, buffer.size)
+            } else {
+                buffer.size
+            }
+            val n = if (size > 0) input.read(buffer, 0, size) else -1
+            if (n > 0) String(buffer, 0, n, StandardCharsets.UTF_8) else ""
+        }.getOrDefault("")
     }
 
     private suspend fun resolveRemoteDestinations(
