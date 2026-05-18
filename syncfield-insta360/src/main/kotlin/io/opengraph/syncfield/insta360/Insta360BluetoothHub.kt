@@ -59,7 +59,10 @@ object Insta360BluetoothHub {
     fun streamId(forRole: String): String = "cam_wrist_$forRole"
 
     suspend fun startScan(context: Context): Flow<DiscoveredInsta360> = stateMutex.withLock {
-        if (scanActive) throw Insta360Error.ScanAlreadyActive
+        if (scanActive) {
+            InstaLog.log(InstaLogCategory.SCAN, event = "scan_already_active_reused")
+            return@withLock discoveries.asSharedFlow()
+        }
         Insta360CommandQueue.shared.runGlobalCommand(timeoutMs = 10_000L) {
             Insta360OneSDKBridge.setup(context)
             val manager = Insta360OneSDKBridge.manager
