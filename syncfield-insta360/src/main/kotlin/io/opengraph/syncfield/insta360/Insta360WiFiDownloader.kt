@@ -57,10 +57,10 @@ internal object Insta360WiFiReachabilityPolicy {
 }
 
 /**
- * Switches the phone onto an Insta360 camera AP, downloads a clip from
- * the SDK socket, and tears down the network request afterwards so the
- * device can reconnect to the user's home WiFi (or fall through to
- * cellular).
+ * Switches the phone onto an Insta360 camera AP, downloads a clip over
+ * the camera's media HTTP endpoint, and tears down the network request
+ * afterwards so the device can reconnect to the user's home WiFi (or
+ * fall through to cellular).
  *
  * Android's [ConnectivityManager.requestNetwork] + [WifiNetworkSpecifier]
  * is the API-29+ replacement for the deprecated
@@ -69,14 +69,15 @@ internal object Insta360WiFiReachabilityPolicy {
  * platform constraint we can't bypass.
  *
  * Mirrors the iOS [Insta360WiFiDownloader.download] flow but uses the
- * Android NetworkRequest API. Reachability is verified with a raw TCP
- * socket because the camera's HTTP root does not have to answer a GET
- * even when the download socket is ready.
+ * Android NetworkRequest API. Reachability is verified against the
+ * OneDriver control port (6666), while media files are fetched from
+ * the camera HTTP server on port 80.
  */
 class Insta360WiFiDownloader(private val context: Context) {
 
     private val defaultCameraHost = "192.168.42.1"
-    private val cameraPort = 6666
+    private val cameraControlPort = 6666
+    private val cameraHttpPort = 80
 
     data class BatchItem(
         val episodeDir: File,
@@ -98,6 +99,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         val port: Int,
         val path: String,
         val sdkHttpPrefix: String,
+        val transport: String,
     )
 
     /**
@@ -442,14 +444,14 @@ class Insta360WiFiDownloader(private val context: Context) {
                 Socket()
             }
             socket.use {
-                it.connect(InetSocketAddress(host, cameraPort), 3_000)
+                it.connect(InetSocketAddress(host, cameraControlPort), 3_000)
             }
             InstaLog.log(
                 InstaLogCategory.WIFI,
                 event = "camera_ap_probe_ok",
                 fields = mapOf(
                     "host" to host,
-                    "port" to cameraPort,
+                    "port" to cameraControlPort,
                     "attempt" to attempt,
                     "network" to (network?.networkHandle ?: -1L),
                 ),
@@ -462,7 +464,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                 event = "camera_ap_probe_failed",
                 fields = mapOf(
                     "host" to host,
-                    "port" to cameraPort,
+                    "port" to cameraControlPort,
                     "attempt" to attempt,
                     "error" to (error.message ?: error::class.java.simpleName),
                 ),
@@ -539,7 +541,13 @@ class Insta360WiFiDownloader(private val context: Context) {
 
         val cameraPath = normalizedCameraFileURI(remoteFileURI)
         var socket: Socket? = null
-        var endpoint = DownloadEndpoint(cameraHost, cameraPort, cameraPath, "")
+        var endpoint = DownloadEndpoint(
+            host = cameraHost,
+            port = cameraHttpPort,
+            path = cameraPath,
+            sdkHttpPrefix = "",
+            transport = "camera_http",
+        )
 
         var written = 0L
         try {
@@ -555,7 +563,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "path" to endpoint.path,
                     "network" to (network?.networkHandle ?: -1L),
                     "destination" to destination.absolutePath,
-                    "transport" to "raw_socket",
+                    "transport" to endpoint.transport,
                     "sdk_http_prefix" to endpoint.sdkHttpPrefix,
                 ),
             )
@@ -588,7 +596,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "status" to code,
                     "content_length" to total,
                     "chunked" to chunked,
-                    "transport" to "raw_socket",
+                    "transport" to endpoint.transport,
                 ),
             )
             if (code !in 200..299) {
@@ -617,6 +625,7 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "port" to endpoint.port,
                     "path" to endpoint.path,
                     "error" to (t.message ?: t::class.java.simpleName),
+                    "transport" to endpoint.transport,
                 ),
             )
             throw Insta360Error.DownloadFailed(t.message ?: "unknown")
@@ -631,7 +640,13 @@ class Insta360WiFiDownloader(private val context: Context) {
             Insta360OneSDKBridge.manager.getCameraHttpPrefix().trim()
         }.getOrDefault("")
         if (sdkHttpPrefix.isBlank()) {
-            return DownloadEndpoint(cameraHost, cameraPort, cameraPath, sdkHttpPrefix)
+            return DownloadEndpoint(
+                host = cameraHost,
+                port = cameraHttpPort,
+                path = cameraPath,
+                sdkHttpPrefix = sdkHttpPrefix,
+                transport = "camera_http",
+            )
         }
 
         val candidate = if (
@@ -649,10 +664,11 @@ class Insta360WiFiDownloader(private val context: Context) {
                 port = when {
                     url.port > 0 -> url.port
                     url.defaultPort > 0 -> url.defaultPort
-                    else -> cameraPort
+                    else -> cameraHttpPort
                 },
                 path = cameraPath,
                 sdkHttpPrefix = sdkHttpPrefix,
+                transport = "sdk_http_prefix",
             )
         }.getOrElse { error ->
             InstaLog.log(
@@ -664,7 +680,13 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "error" to (error.message ?: error::class.java.simpleName),
                 ),
             )
-            DownloadEndpoint(cameraHost, cameraPort, cameraPath, sdkHttpPrefix)
+            DownloadEndpoint(
+                host = cameraHost,
+                port = cameraHttpPort,
+                path = cameraPath,
+                sdkHttpPrefix = sdkHttpPrefix,
+                transport = "camera_http",
+            )
         }
     }
 
