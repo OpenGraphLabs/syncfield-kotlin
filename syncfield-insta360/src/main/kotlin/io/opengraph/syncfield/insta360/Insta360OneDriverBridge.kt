@@ -8,6 +8,7 @@ import com.arashivision.onecamera.OneDriver
 import com.arashivision.onecamera.OneDriverInfo
 import com.arashivision.onecamera.Options
 import com.arashivision.onecamera.camerarequest.TakePicture
+import com.arashivision.onecamera.cameraresponse.GetOptionsResp
 import com.arashivision.onecamera.cameraresponse.OpenCameraWifiResp
 import com.arashivision.onecamera.cameraresponse.StreamData
 import com.arashivision.onecamera.cameraresponse.TakePictureResponse
@@ -447,6 +448,162 @@ internal class Insta360OneDriverBridge private constructor(
             }
         }
         delay(WIFI_AP_SETTLE_DELAY_MS)
+    }
+
+    suspend fun fetchWifiCredentials(
+        deviceName: String?,
+        stableId: String?,
+        timeoutMs: Long = 8_000L,
+    ): Insta360ResolvedWifiCredentials? {
+        if (closed) throw Insta360Error.CommandFailed("OneDriverBridge closed")
+        val response = fetchWifiOptions(timeoutMs, allOptions = false)
+        val options = response.result
+        try {
+            val wifi = options?.wifiInfo
+            val rawSsid = wifi?.ssid?.trim().orEmpty()
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "onedriver_wifi_options_received",
+                fields = mapOf(
+                    "requestId" to response.requestID,
+                    "errorCode" to response.errorCode,
+                    "ssid" to rawSsid,
+                    "has_password" to (!wifi?.pwd.isNullOrBlank()),
+                    "channel" to (wifi?.channel ?: 0),
+                    "mode" to (wifi?.mode ?: 0),
+                    "state" to (wifi?.state ?: 0),
+                    "busy" to (wifi?.isBusy ?: false),
+                    "mac" to (wifi?.macAddress ?: ""),
+                ),
+            )
+            if (response.errorCode != 0) {
+                throw Insta360Error.CommandFailed(
+                    "get wifi options failed code=${response.errorCode}"
+                )
+            }
+            if (rawSsid.isBlank()) {
+                return fetchWifiCredentialsFromAllOptions(
+                    deviceName = deviceName,
+                    stableId = stableId,
+                    timeoutMs = timeoutMs,
+                )
+            }
+            return resolveInsta360WifiCredentials(
+                deviceName = deviceName,
+                stableId = stableId,
+                sdkSsid = rawSsid,
+                sdkPassword = wifi?.pwd,
+                preferSdkSsid = true,
+            )
+        } finally {
+            runCatching { options?.release() }
+        }
+    }
+
+    private suspend fun fetchWifiCredentialsFromAllOptions(
+        deviceName: String?,
+        stableId: String?,
+        timeoutMs: Long,
+    ): Insta360ResolvedWifiCredentials? {
+        val response = fetchWifiOptions(timeoutMs, allOptions = true)
+        val options = response.result
+        try {
+            val wifi = options?.wifiInfo
+            val rawSsid = wifi?.ssid?.trim().orEmpty()
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "onedriver_all_options_wifi_received",
+                fields = mapOf(
+                    "requestId" to response.requestID,
+                    "errorCode" to response.errorCode,
+                    "ssid" to rawSsid,
+                    "has_password" to (!wifi?.pwd.isNullOrBlank()),
+                    "channel" to (wifi?.channel ?: 0),
+                    "mode" to (wifi?.mode ?: 0),
+                    "state" to (wifi?.state ?: 0),
+                    "busy" to (wifi?.isBusy ?: false),
+                    "mac" to (wifi?.macAddress ?: ""),
+                ),
+            )
+            if (response.errorCode != 0 || rawSsid.isBlank()) return null
+            return resolveInsta360WifiCredentials(
+                deviceName = deviceName,
+                stableId = stableId,
+                sdkSsid = rawSsid,
+                sdkPassword = wifi?.pwd,
+                preferSdkSsid = true,
+            )
+        } finally {
+            runCatching { options?.release() }
+        }
+    }
+
+    private suspend fun fetchWifiOptions(timeoutMs: Long, allOptions: Boolean): GetOptionsResp {
+        val ack = CompletableDeferred<GetOptionsResp>()
+        var expectedRequestId = Long.MIN_VALUE
+        val collector = bridgeScope.launch {
+            infoNotifications
+                .filter { it.what == OneDriverInfo.Response.InfoType.GET_OPTIONS }
+                .collect { event ->
+                    val response = event.obj as? GetOptionsResp
+                    if (response == null) {
+                        if (!ack.isCompleted) {
+                            ack.completeExceptionally(
+                                Insta360Error.CommandFailed(
+                                    "get options returned ${event.obj?.javaClass?.name ?: "null"}"
+                                )
+                            )
+                        }
+                        return@collect
+                    }
+                    if (expectedRequestId == Long.MIN_VALUE ||
+                        response.requestID == expectedRequestId
+                    ) {
+                        if (!ack.isCompleted) ack.complete(response)
+                    }
+                }
+        }
+        try {
+            val optionKeys = listOf(
+                OneDriverInfo.Options.WIFI_SSID,
+                OneDriverInfo.Options.WIFI_PWD,
+                OneDriverInfo.Options.WIFI_CH,
+                OneDriverInfo.Options.WIFI_MODE,
+                OneDriverInfo.Options.WIFI_STATE,
+                OneDriverInfo.Options.WIFI_STATUS,
+                OneDriverInfo.Options.WIFI_PWD_VERSION,
+                OneDriverInfo.Options.WIFI_IS_BUSY,
+                OneDriverInfo.Options.WIFI_MAC_ADDRESS,
+            )
+            val requestOptions = RequestOptions().apply {
+                this.timeoutMs = timeoutMs.toInt()
+            }
+            val requestId = if (allOptions) {
+                oneDriver.getAllOptionsAsync(requestOptions)
+            } else {
+                oneDriver.getOptionsAsync(optionKeys, requestOptions)
+            }
+            expectedRequestId = requestId
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = if (allOptions) {
+                    "onedriver_get_all_options_sent"
+                } else {
+                    "onedriver_get_wifi_options_sent"
+                },
+                fields = mapOf(
+                    "requestId" to requestId,
+                    "timeout_ms" to timeoutMs,
+                    "keys" to if (allOptions) listOf("ALL") else optionKeys,
+                ),
+            )
+            if (requestId < 0) {
+                throw Insta360Error.CommandFailed("get wifi options returned requestId=$requestId")
+            }
+            return withTimeout(timeoutMs + 1_000L) { ack.await() }
+        } finally {
+            collector.cancel()
+        }
     }
 
     private suspend fun setWifiStatusOn(timeoutMs: Long): WifiEnableState {

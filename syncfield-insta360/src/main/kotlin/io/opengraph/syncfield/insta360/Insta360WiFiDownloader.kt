@@ -12,7 +12,7 @@ import android.os.Build
 import android.os.SystemClock
 import androidx.annotation.RequiresApi
 import com.arashivision.sdkcamera.camera.InstaCameraManager
-import com.arashivision.sdkcamera.camera.callback.ICameraOperateCallback
+import com.arashivision.sdkcamera.camera.callback.ICameraChangedCallback
 import io.opengraph.syncfield.insta360.logging.InstaLog
 import io.opengraph.syncfield.insta360.logging.InstaLogCategory
 import io.opengraph.syncfield.insta360.logging.InstaLogLevel
@@ -168,7 +168,7 @@ class Insta360WiFiDownloader(private val context: Context) {
             waitForReachability(cm)
             fetchCameraFileInfoList()
         } finally {
-            closeCameraWifi()
+            closeSdkWifiCamera()
             releaseCameraNetwork(cm, callback)
         }
     }
@@ -235,10 +235,20 @@ class Insta360WiFiDownloader(private val context: Context) {
         attempt: Int,
         timeoutMs: Long,
     ): ConnectivityManager.NetworkCallback {
-        val specifier = WifiNetworkSpecifier.Builder()
+        val visibleTarget = logWifiScanSnapshot(
+            ssid = ssid,
+            phase = "before_request",
+            attempt = attempt,
+            hiddenSsid = false,
+        )
+        val hiddenSsid = !visibleTarget
+        val specifierBuilder = WifiNetworkSpecifier.Builder()
             .setSsid(ssid)
             .setWpa2Passphrase(passphrase)
-            .build()
+        if (hiddenSsid) {
+            specifierBuilder.setIsHiddenSsid(true)
+        }
+        val specifier = specifierBuilder.build()
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -262,12 +272,21 @@ class Insta360WiFiDownloader(private val context: Context) {
                 if (!onAvailable.isCompleted) onAvailable.complete(network)
             }
             override fun onUnavailable() {
-                logWifiScanSnapshot(ssid = ssid, phase = "on_unavailable", attempt = attempt)
+                logWifiScanSnapshot(
+                    ssid = ssid,
+                    phase = "on_unavailable",
+                    attempt = attempt,
+                    hiddenSsid = hiddenSsid,
+                )
                 InstaLog.log(
                     InstaLogCategory.WIFI,
                     level = InstaLogLevel.WARN,
                     event = "camera_ap_join_unavailable",
-                    fields = mapOf("ssid" to ssid, "attempt" to attempt),
+                    fields = mapOf(
+                        "ssid" to ssid,
+                        "attempt" to attempt,
+                        "hidden_ssid" to hiddenSsid,
+                    ),
                 )
                 if (!onAvailable.isCompleted) {
                     onAvailable.completeExceptionally(
@@ -283,9 +302,9 @@ class Insta360WiFiDownloader(private val context: Context) {
                 "ssid" to ssid,
                 "attempt" to attempt,
                 "timeout_ms" to timeoutMs,
+                "hidden_ssid" to hiddenSsid,
             ),
         )
-        logWifiScanSnapshot(ssid = ssid, phase = "before_request", attempt = attempt)
         cm.requestNetwork(request, cb, timeoutMs.toInt())
         try {
             withTimeoutOrNull(
@@ -306,10 +325,15 @@ class Insta360WiFiDownloader(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private fun logWifiScanSnapshot(ssid: String, phase: String, attempt: Int) {
+    private fun logWifiScanSnapshot(
+        ssid: String,
+        phase: String,
+        attempt: Int,
+        hiddenSsid: Boolean,
+    ): Boolean {
         val wifiManager = context.applicationContext
             .getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            ?: return
+            ?: return false
         val results = runCatching {
             wifiManager.scanResults
                 .asSequence()
@@ -338,11 +362,13 @@ class Insta360WiFiDownloader(private val context: Context) {
                     "ssid" to ssid,
                     "phase" to phase,
                     "attempt" to attempt,
+                    "hidden_ssid" to hiddenSsid,
                     "error" to (error.message ?: error::class.java.simpleName),
                 ),
             )
-            return
+            return false
         }
+        val visibleTarget = results.any { it.startsWith("$ssid@") }
         InstaLog.log(
             InstaLogCategory.WIFI,
             event = "wifi_scan_snapshot",
@@ -350,10 +376,12 @@ class Insta360WiFiDownloader(private val context: Context) {
                 "ssid" to ssid,
                 "phase" to phase,
                 "attempt" to attempt,
-                "visible_target" to results.any { it.startsWith("$ssid@") },
+                "hidden_ssid" to hiddenSsid,
+                "visible_target" to visibleTarget,
                 "matches" to results,
             ),
         )
+        return visibleTarget
     }
 
     private suspend fun waitForReachability(cm: ConnectivityManager) {
@@ -469,7 +497,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         var lastError: Throwable? = null
         repeat(2) { attempt ->
             try {
-                openCameraWifi()
+                ensureSdkWifiCameraOpen()
                 val manager = Insta360OneSDKBridge.manager
                 val urls = (manager.getAllUrlListIncludeRecording() + manager.rawUrlListOrEmpty())
                     .mapNotNull(::normalizedCameraFileURIOrNull)
@@ -485,7 +513,7 @@ class Insta360WiFiDownloader(private val context: Context) {
             } catch (t: Throwable) {
                 lastError = t
             } finally {
-                closeCameraWifi()
+                closeSdkWifiCamera()
             }
             if (attempt == 0) delay(500)
         }
@@ -493,38 +521,59 @@ class Insta360WiFiDownloader(private val context: Context) {
             "camera album listing failed (${lastError?.message ?: "unknown"})")
     }
 
-    private suspend fun openCameraWifi() {
-        val result = CompletableDeferred<Unit>()
-        Insta360OneSDKBridge.manager.openCameraWifi(object : ICameraOperateCallback {
-            override fun onSuccessful() {
-                if (!result.isCompleted) result.complete(Unit)
-            }
+    private suspend fun ensureSdkWifiCameraOpen(timeoutMs: Long = 8_000L) {
+        val manager = Insta360OneSDKBridge.manager
+        if (manager.cameraConnectedType == InstaCameraManager.CONNECT_TYPE_WIFI) {
+            InstaLog.log(InstaLogCategory.WIFI, event = "sdk_wifi_camera_already_open")
+            return
+        }
 
-            override fun onFailed() {
-                if (!result.isCompleted) {
-                    result.completeExceptionally(
-                        Insta360Error.DownloadFailed("openCameraWifi failed"))
+        val opened = CompletableDeferred<Unit>()
+        val listener = object : ICameraChangedCallback {
+            override fun onCameraStatusChanged(enabled: Boolean, connectType: Int) {
+                if (
+                    enabled &&
+                    connectType == InstaCameraManager.CONNECT_TYPE_WIFI &&
+                    !opened.isCompleted
+                ) {
+                    opened.complete(Unit)
                 }
             }
 
-            override fun onCameraConnectError() {
-                if (!result.isCompleted) {
-                    result.completeExceptionally(
-                        Insta360Error.DownloadFailed("openCameraWifi camera connect error"))
+            override fun onCameraConnectError(errorCode: Int) {
+                if (!opened.isCompleted) {
+                    opened.completeExceptionally(
+                        Insta360Error.DownloadFailed("SDK WiFi camera connect error code=$errorCode")
+                    )
                 }
             }
-        })
-        withTimeoutOrNull(12_000) { result.await() }
-            ?: throw Insta360Error.DownloadFailed("openCameraWifi timed out after 12s")
+        }
+        manager.registerCameraChangedCallback(listener)
+        try {
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                event = "sdk_wifi_camera_open_requested",
+                fields = mapOf("timeout_ms" to timeoutMs),
+            )
+            manager.openCamera(InstaCameraManager.CONNECT_TYPE_WIFI)
+            val connected = withTimeoutOrNull(timeoutMs) { opened.await() }
+            if (connected == null &&
+                manager.cameraConnectedType != InstaCameraManager.CONNECT_TYPE_WIFI
+            ) {
+                throw Insta360Error.DownloadFailed("SDK WiFi camera open timed out after ${timeoutMs}ms")
+            }
+            InstaLog.log(InstaLogCategory.WIFI, event = "sdk_wifi_camera_open_ok")
+        } finally {
+            runCatching { manager.unregisterCameraChangedCallback(listener) }
+        }
     }
 
-    private fun closeCameraWifi() {
+    private fun closeSdkWifiCamera() {
         runCatching {
-            Insta360OneSDKBridge.manager.closeCameraWifi(object : ICameraOperateCallback {
-                override fun onSuccessful() = Unit
-                override fun onFailed() = Unit
-                override fun onCameraConnectError() = Unit
-            })
+            if (Insta360OneSDKBridge.manager.cameraConnectedType == InstaCameraManager.CONNECT_TYPE_WIFI) {
+                Insta360OneSDKBridge.manager.closeCamera()
+                InstaLog.log(InstaLogCategory.WIFI, event = "sdk_wifi_camera_closed")
+            }
         }
     }
 
@@ -573,6 +622,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         cm: ConnectivityManager,
         callback: ConnectivityManager.NetworkCallback,
     ) {
+        closeSdkWifiCamera()
         runCatching { cm.bindProcessToNetwork(null) }
         runCatching { cm.unregisterNetworkCallback(callback) }
         awaitNetworkRestore(cm, Insta360WiFiReachabilityPolicy.restoreTimeoutMs)

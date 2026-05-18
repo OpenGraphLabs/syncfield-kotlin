@@ -3,7 +3,6 @@ package io.opengraph.syncfield.insta360
 import android.content.Context
 import com.arashivision.sdkcamera.camera.InstaCameraManager
 import com.arashivision.sdkcamera.camera.callback.ICameraChangedCallback
-import com.arashivision.sdkcamera.camera.callback.ICameraOperateCallback
 import com.arashivision.sdkcamera.camera.callback.ICaptureStatusListener
 import com.arashivision.sdkcamera.camera.callback.IScanBleListener
 import com.arashivision.sdkcamera.camera.model.CaptureMode
@@ -340,13 +339,13 @@ class Insta360BLEController(
         val device = requireDevice()
         return commandQueue.runDeviceCommand(
             commandId(device),
-            timeoutMs = 5_000L,
+            timeoutMs = 25_000L,
             retries = 0,
             sdkCritical = false,
         ) {
             val resolved = resolveWifiCredentialsForDevice(
                 device = device,
-                fetchOptions = false,
+                fetchOptions = true,
                 preferCached = true,
             )
             val ssid = resolved.ssid
@@ -405,8 +404,9 @@ class Insta360BLEController(
         fetchOptions: Boolean,
         preferCached: Boolean,
     ): Insta360ResolvedWifiCredentials {
-        if (preferCached) {
-            cachedWifiCredentialsFor(device)?.let { cached ->
+        val cached = cachedWifiCredentialsFor(device)
+        if (preferCached && cached != null) {
+            if (!fetchOptions || cached.ssidSource == "sdk") {
                 InstaLog.log(
                     InstaLogCategory.BLE,
                     event = "wifi_credentials_cache_hit",
@@ -418,33 +418,79 @@ class Insta360BLEController(
                 )
                 return cached
             }
+            InstaLog.log(
+                InstaLogCategory.BLE,
+                event = "wifi_credentials_cache_refresh_needed",
+                fields = mapOf(
+                    "ssid" to cached.ssid,
+                    "ssid_source" to cached.ssidSource,
+                    "password_source" to cached.passwordSource,
+                ),
+            )
         }
 
-        var fetchedOptions = false
+        val stableId = Insta360OneSDKBridge.stableId(device)
         if (fetchOptions) {
-            runCatching { fetchCameraOptions(timeoutMs = 3_000L) }
-                .onSuccess {
-                    fetchedOptions = true
-                    InstaLog.log(InstaLogCategory.BLE, event = "wifi_credentials_options_prefetch_ok")
+            runCatching {
+                oneDriverBridge?.fetchWifiCredentials(
+                    deviceName = device.name,
+                    stableId = stableId,
+                    timeoutMs = 8_000L,
+                )
+            }
+                .onSuccess { resolved ->
+                    if (resolved != null && resolved.ssid.isNotBlank()) {
+                        cachedWifiCredentials = CachedInsta360WifiCredentials(
+                            deviceKey = wifiCredentialCacheKey(device),
+                            credentials = resolved,
+                        )
+                        InstaLog.log(
+                            InstaLogCategory.BLE,
+                            event = "wifi_credentials_onedriver_options_ok",
+                            fields = mapOf(
+                                "ssid" to resolved.ssid,
+                                "ssid_source" to resolved.ssidSource,
+                                "password_source" to resolved.passwordSource,
+                            ),
+                        )
+                        return resolved
+                    }
+                    InstaLog.log(
+                        InstaLogCategory.BLE,
+                        level = InstaLogLevel.WARN,
+                        event = "wifi_credentials_onedriver_options_empty",
+                    )
                 }
                 .onFailure { error ->
                     InstaLog.log(
                         InstaLogCategory.BLE,
                         level = InstaLogLevel.WARN,
-                        event = "wifi_credentials_options_prefetch_failed",
+                        event = "wifi_credentials_onedriver_options_failed",
                         fields = mapOf("error" to (error.message ?: error::class.java.simpleName)),
                     )
                 }
+            if (preferCached && cached != null) {
+                InstaLog.log(
+                    InstaLogCategory.BLE,
+                    level = InstaLogLevel.WARN,
+                    event = "wifi_credentials_cache_fallback",
+                    fields = mapOf(
+                        "ssid" to cached.ssid,
+                        "ssid_source" to cached.ssidSource,
+                        "password_source" to cached.passwordSource,
+                    ),
+                )
+                return cached
+            }
         }
 
-        val stableId = Insta360OneSDKBridge.stableId(device)
         val wifi = runCatching { manager.wifiInfo }.getOrNull()
         val resolved = resolveInsta360WifiCredentials(
             deviceName = device.name,
             stableId = stableId,
             sdkSsid = wifi?.ssid,
             sdkPassword = wifi?.pwd,
-            preferSdkSsid = fetchedOptions,
+            preferSdkSsid = false,
         )
         if (resolved.ssid.isNotBlank()) {
             cachedWifiCredentials = CachedInsta360WifiCredentials(
@@ -974,28 +1020,6 @@ class Insta360BLEController(
             runCatching { manager.unregisterCameraChangedCallback(it) }
             disconnectListener = null
         }
-    }
-
-    private suspend fun fetchCameraOptions(timeoutMs: Long = 10_000L) {
-        val done = CompletableDeferred<Unit>()
-        manager.fetchCameraOptions(object : ICameraOperateCallback {
-            override fun onSuccessful() {
-                if (!done.isCompleted) done.complete(Unit)
-            }
-
-            override fun onFailed() {
-                if (!done.isCompleted) {
-                    done.completeExceptionally(Insta360Error.CommandFailed("fetch camera options failed"))
-                }
-            }
-
-            override fun onCameraConnectError() {
-                if (!done.isCompleted) {
-                    done.completeExceptionally(Insta360Error.CommandFailed("camera connect error"))
-                }
-            }
-        })
-        withTimeout(timeoutMs) { done.await() }
     }
 
     private suspend fun ensureNormalRecordMode() {
