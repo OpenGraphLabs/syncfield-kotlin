@@ -576,7 +576,17 @@ class Insta360WiFiDownloader(private val context: Context) {
             wifiManager.enableNetwork(addedNetId, /*disableOthers=*/true)
         }.getOrDefault(false)
         if (!enableOk) {
-            runCatching { wifiManager.removeNetwork(addedNetId) }
+            // `enableNetwork(_, disableOthers=true)` may have already
+            // disabled the user's saved networks before failing — fully
+            // restore so a single failed join doesn't leave the device
+            // unable to auto-reconnect to home Wi-Fi.
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "enable_network_failed",
+            )
             throw Insta360Error.HotspotApplyFailed(
                 "enableNetwork returned false for netId=$addedNetId SSID=$ssid [legacy]"
             )
@@ -636,7 +646,13 @@ class Insta360WiFiDownloader(private val context: Context) {
         }
         runCatching { cm.registerNetworkCallback(request, cb) }
             .onFailure { error ->
-                runCatching { wifiManager.removeNetwork(addedNetId) }
+                restoreLegacyWifiState(
+                    wifiManager = wifiManager,
+                    addedNetId = addedNetId,
+                    previouslyEnabledNetIds = previouslyEnabledNetIds,
+                    eventPrefix = "wifi_legacy_restore",
+                    phase = "register_callback_failed",
+                )
                 throw Insta360Error.HotspotApplyFailed(
                     "registerNetworkCallback failed [legacy]: ${error.message}"
                 )
@@ -650,11 +666,23 @@ class Insta360WiFiDownloader(private val context: Context) {
                 )
         } catch (t: CancellationException) {
             runCatching { cm.unregisterNetworkCallback(cb) }
-            runCatching { wifiManager.removeNetwork(addedNetId) }
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "join_cancelled",
+            )
             throw t
         } catch (t: Throwable) {
             runCatching { cm.unregisterNetworkCallback(cb) }
-            runCatching { wifiManager.removeNetwork(addedNetId) }
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "join_failed",
+            )
             if (t is Insta360Error) throw t
             throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown [legacy]")
         }
@@ -1341,39 +1369,78 @@ class Insta360WiFiDownloader(private val context: Context) {
      * Removes the [WifiConfiguration] we added in
      * [applyNetworkSuggestionLegacy] and best-effort re-enables the
      * caller's previously-saved networks so the supplicant can
-     * reconnect to the user's home Wi-Fi. Every step is wrapped in
-     * [runCatching] because OEM Wi-Fi stacks on P frequently return
-     * `false` for transient reasons; failures are observable through
-     * `wifi_legacy_release_*` log events.
+     * reconnect to the user's home Wi-Fi. Wraps the shared
+     * [restoreLegacyWifiState] helper with the `wifi_legacy_release_*`
+     * event prefix so successful-teardown telemetry stays distinct
+     * from `wifi_legacy_restore_*` events emitted on join-failure
+     * cleanup paths.
      */
     @SuppressLint("MissingPermission")
     private fun releaseLegacyWifiConfiguration(join: CameraNetworkJoin.Legacy) {
         val wifiManager = context.applicationContext
             .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        restoreLegacyWifiState(
+            wifiManager = wifiManager,
+            addedNetId = join.addedNetId,
+            previouslyEnabledNetIds = join.previouslyEnabledNetIds,
+            eventPrefix = "wifi_legacy_release",
+            phase = "release",
+        )
+    }
+
+    /**
+     * Removes the camera-AP [WifiConfiguration] we added via
+     * [WifiManager.addNetwork] and best-effort re-enables the saved
+     * configs that were enabled before
+     * `enableNetwork(_, disableOthers=true)` ran, then calls
+     * `reconnect()` so the supplicant can pick the highest-priority
+     * saved network. Every step is wrapped in [runCatching] because
+     * OEM Wi-Fi stacks on P frequently return `false` for transient
+     * reasons.
+     *
+     * Used by both the successful-teardown path
+     * ([releaseLegacyWifiConfiguration]) and the four failure paths
+     * inside [requestCameraNetworkLegacyOnce] (enableNetwork
+     * returning false, registerNetworkCallback throwing, join await
+     * cancellation, join await throwing). The `eventPrefix` keeps the
+     * two telemetry streams distinguishable in production logs.
+     */
+    @SuppressLint("MissingPermission")
+    private fun restoreLegacyWifiState(
+        wifiManager: WifiManager?,
+        addedNetId: Int,
+        previouslyEnabledNetIds: List<Int>,
+        eventPrefix: String,
+        phase: String,
+    ) {
         if (wifiManager == null) {
             InstaLog.log(
                 InstaLogCategory.WIFI,
                 level = InstaLogLevel.WARN,
-                event = "wifi_legacy_release_no_manager",
-                fields = mapOf("net_id" to join.addedNetId),
+                event = "${eventPrefix}_no_manager",
+                fields = mapOf(
+                    "net_id" to addedNetId,
+                    "phase" to phase,
+                ),
             )
             return
         }
-        val removed = runCatching { wifiManager.removeNetwork(join.addedNetId) }
+        val removed = runCatching { wifiManager.removeNetwork(addedNetId) }
             .getOrElse { error ->
                 InstaLog.log(
                     InstaLogCategory.WIFI,
                     level = InstaLogLevel.WARN,
-                    event = "wifi_legacy_release_remove_failed",
+                    event = "${eventPrefix}_remove_failed",
                     fields = mapOf(
-                        "net_id" to join.addedNetId,
+                        "net_id" to addedNetId,
+                        "phase" to phase,
                         "error" to (error.message ?: error::class.java.simpleName),
                     ),
                 )
                 false
             }
         val restored = mutableListOf<Int>()
-        for (netId in join.previouslyEnabledNetIds) {
+        for (netId in previouslyEnabledNetIds) {
             val ok = runCatching { wifiManager.enableNetwork(netId, /*disableOthers=*/false) }
                 .getOrDefault(false)
             if (ok) restored += netId
@@ -1381,12 +1448,13 @@ class Insta360WiFiDownloader(private val context: Context) {
         runCatching { wifiManager.reconnect() }
         InstaLog.log(
             InstaLogCategory.WIFI,
-            event = "wifi_legacy_release_done",
+            event = "${eventPrefix}_done",
             fields = mapOf(
-                "net_id" to join.addedNetId,
+                "net_id" to addedNetId,
+                "phase" to phase,
                 "removed" to removed,
                 "restored_net_ids" to restored,
-                "previously_enabled_count" to join.previouslyEnabledNetIds.size,
+                "previously_enabled_count" to previouslyEnabledNetIds.size,
             ),
         )
     }
