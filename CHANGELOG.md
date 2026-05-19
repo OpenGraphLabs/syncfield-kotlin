@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.2] — 2026-05-19
+
+Lowers `syncfield-insta360`'s `minSdk` floor from 29 to 28 so apps on Android 9 / API 28 can link the module without the `tools:overrideLibrary` hack. The Q+ `WifiNetworkSpecifier` path that ships in 0.7.x stays bit-for-bit identical when `Build.VERSION.SDK_INT >= Q`; on P the downloader internally falls back to the pre-deprecation `WifiManager.addNetwork` + `enableNetwork` + `bindProcessToNetwork` flow. The SDK_INT branching lives entirely inside `Insta360WiFiDownloader` — `download` / `downloadBatch` / `listFiles` keep the same public signature host apps already call.
+
+### Added
+- **API 28 fallback inside `Insta360WiFiDownloader`** — new `applyNetworkSuggestionLegacy` + `requestCameraNetworkLegacyOnce` private path mirroring the existing Q+ retry-with-deadline shape. Internally tracked via a private `CameraNetworkJoin` sealed class (`Modern` carries only the `NetworkCallback`; `Legacy` additionally carries the `addNetwork` netId + the previously-enabled config snapshot) so `releaseCameraNetwork` can tear down the correct platform state per branch.
+- **`buildLegacyWifiConfiguration(ssid, passphrase, hiddenSsid)`** (internal, top-level) — produces a `WifiConfiguration` wired for the GO 3S firmware variants in the wild: WPA_PSK key management, both RSN + WPA protocols, CCMP + TKIP pairwise/group ciphers, quoted SSID/PSK.
+- **`legacyConnectionMatchesTarget(rawConnectedSsid, target)`** (internal, top-level) — pure-string matcher used inside the legacy `NetworkCallback.onAvailable` to debounce false positives: strips literal double quotes, rejects `<unknown ssid>` placeholders, rejects blanks. Without this debounce the callback would bind us to whichever Wi-Fi transport Android happens to surface first (often the user's home network mid-transition).
+- **`Insta360WiFiDownloaderLegacyHelpersTest`** — Robolectric (`@Config(sdk = [28])`) coverage of every helper: quote-stripping, key-management bits, hidden-SSID flag, protocol/cipher bits, `<unknown ssid>` rejection, case-sensitive match, special-char SSID match (`GO 3S 1234.OSC`). Sibling `@Config(sdk = [29])` sanity test guards against accidental dispatcher-branch flip.
+
+### Changed
+- **`syncfield-insta360/build.gradle.kts`**: `minSdk = 29` → `minSdk = 28`. Comment updated to document the dispatcher split. Other modules (`syncfield-core`, `-streams`, `-tactile`, `-ui`) are unchanged — they already sit at `minSdk = 26`.
+- **`Insta360WiFiDownloader.download` / `.downloadBatch` / `.listFiles`** drop their `@RequiresApi(Build.VERSION_CODES.Q)` annotation (the SDK_INT dispatch happens internally). The Q+ helpers `applyNetworkSuggestion` and `requestCameraNetworkOnce` keep their `@RequiresApi(Q)` annotation as a defense-in-depth contract.
+
+### Not changed
+- The Q+ join + reachability + fetch pipeline (`applyNetworkSuggestion`, `requestCameraNetworkOnce`, `waitForReachability`, `fetchResource`, `logWifiScanSnapshot`, `logNetworkSnapshot`, `releaseCameraNetwork`'s common path). Behavior on Android 10+ is byte-for-byte identical to 0.7.1 — the only change to that branch is that its callback is wrapped in `CameraNetworkJoin.Modern` before being handed to `releaseCameraNetwork`.
+- Every non-Wi-Fi module (`Insta360BLEController`, `Insta360GattHandshake`, `Insta360DirectGattConnector`, `Insta360OneSDKBridge`, `Insta360CameraSupervisor`, `Insta360RadioGate`, `Insta360KnownCameraIdentity`). No Q+ APIs were used outside the downloader.
+- `AndroidManifest.xml` permissions — `ACCESS_FINE_LOCATION` / `CHANGE_WIFI_STATE` / `CHANGE_NETWORK_STATE` / `ACCESS_NETWORK_STATE` already cover both code paths. Host apps that already request the runtime fine-location prompt need no further work.
+
+### Compatibility caveats for API 28
+- **System-scoped, not app-scoped**: the legacy `enableNetwork(_, /*disableOthers=*/true)` flow briefly takes the device's Wi-Fi onto the camera AP, disconnecting every app for the duration of the download. The Q+ specifier path is app-scoped and does not have this issue. This is a platform constraint, not something we can polyfill.
+- **Best-effort restore**: on teardown we re-enable each previously-saved `WifiConfiguration` and call `reconnect()`. The supplicant then picks the highest-priority enabled network; how fast it picks the user's home Wi-Fi is OEM-dependent. Apps targeting API 28 should not assume connectivity is restored within any specific deadline.
+- **No on-device test coverage**: the legacy path has been validated by unit test and code review only — no Android 9 hardware is currently in the test lab. Production telemetry (`camera_ap_join_*_legacy` / `wifi_legacy_release_*` / `wifi_legacy_restore_*` events emitted via `InstaLog`) is the canary; surface any OEM-specific anomalies through the host app's logging pipeline.
+
+### Fixed
+- **Failed-join cleanup leaves saved Wi-Fi disabled** — extracted `restoreLegacyWifiState` helper now runs on all four legacy-path failure exits (`enableNetwork` returning `false`, `registerNetworkCallback` throwing, join await cancellation, join await timing out/throwing). Previously these exits only removed the camera `WifiConfiguration` and skipped the `previouslyEnabledNetIds` restore — a single failed join could leave the user's home Wi-Fi disabled because `enableNetwork(_, disableOthers=true)` already ran. The successful-teardown path keeps emitting `wifi_legacy_release_*` events; the new failure-cleanup paths emit `wifi_legacy_restore_*` with a `phase` field (`enable_network_failed` / `register_callback_failed` / `join_cancelled` / `join_failed`) so the two streams stay distinguishable in production logs. Modern (Q+) path is unaffected.
+
+### Tests
+- New `Insta360WiFiDownloaderLegacyHelpersTest` (above). `SyncFieldVersionTest` bumped to track the new `current`. Maintainers should run `./gradlew :syncfield-insta360:testDebugUnitTest :syncfield-core:testDebugUnitTest` before tagging.
+
 ## [0.7.1] — 2026-05-19
 
 Adds passive audio-interruption observability to `AndroidCameraStream`, mirroring the audio-recovery health events `syncfield-swift` 0.10.0 ships on iOS. iOS shipped an active recovery path (re-attaching `AVCaptureAudioDataOutput` on `AVAudioSession.interruptionNotification.ended`); Android cannot mirror that because CameraX abstracts the audio source and active recovery would risk the single-file invariant downstream pipelines rely on. Instead the SDK surfaces the two health events JS already consumes, and the host app decides how to react.

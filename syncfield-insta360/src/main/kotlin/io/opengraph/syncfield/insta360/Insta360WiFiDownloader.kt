@@ -7,6 +7,8 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiConfiguration
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
@@ -57,6 +59,62 @@ internal object Insta360WiFiReachabilityPolicy {
 }
 
 /**
+ * Builds a WPA2-PSK [WifiConfiguration] for the API 28 legacy join
+ * path. Exposed as an internal top-level function so the SSID/PSK
+ * quoting and WPA_PSK key-management bits can be exercised without
+ * standing up a full downloader on the JVM.
+ *
+ * Android's pre-Q supplicant requires both fields to be wrapped in
+ * literal double quotes. Hidden SSIDs additionally need the
+ * `hiddenSSID` flag — otherwise the supplicant won't probe for them.
+ */
+internal fun buildLegacyWifiConfiguration(
+    ssid: String,
+    passphrase: String,
+    hiddenSsid: Boolean,
+): WifiConfiguration = WifiConfiguration().apply {
+    SSID = "\"$ssid\""
+    preSharedKey = "\"$passphrase\""
+    hiddenSSID = hiddenSsid
+    allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
+    allowedAuthAlgorithms.set(WifiConfiguration.AuthAlgorithm.OPEN)
+    allowedProtocols.set(WifiConfiguration.Protocol.RSN)
+    allowedProtocols.set(WifiConfiguration.Protocol.WPA)
+    allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP)
+    allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP)
+    allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP)
+    allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP)
+}
+
+/**
+ * Compares the active [WifiInfo.getSsid] (which Android wraps in
+ * literal double quotes on most OEMs) against the SSID we asked the
+ * supplicant to join. Treats `<unknown ssid>` — the placeholder
+ * returned before association completes or when location permission
+ * is missing — as "no match".
+ *
+ * Pure-string logic so it's covered by a JVM unit test; the legacy
+ * [ConnectivityManager.NetworkCallback] uses it to debounce false
+ * positives where Android briefly hands us a [Network] for a
+ * different transport (cellular dropped, captive portal, etc.).
+ */
+internal fun legacyConnectionMatchesTarget(
+    rawConnectedSsid: String?,
+    target: String,
+): Boolean {
+    val raw = rawConnectedSsid?.trim() ?: return false
+    if (raw.isBlank()) return false
+    val stripped = if (raw.length >= 2 && raw.first() == '"' && raw.last() == '"') {
+        raw.substring(1, raw.length - 1)
+    } else {
+        raw
+    }
+    if (stripped.equals("<unknown ssid>", ignoreCase = true)) return false
+    if (stripped.isBlank()) return false
+    return stripped == target
+}
+
+/**
  * Switches the phone onto an Insta360 camera AP, downloads a clip over
  * the camera's media HTTP endpoint, and tears down the network request
  * afterwards so the device can reconnect to the user's home WiFi (or
@@ -103,12 +161,33 @@ class Insta360WiFiDownloader(private val context: Context) {
     )
 
     /**
+     * Tracks how we joined the camera AP so [releaseCameraNetwork] can
+     * tear down the correct platform state. The Q+ branch only owns a
+     * [ConnectivityManager.NetworkCallback]; the P branch additionally
+     * owns a `WifiConfiguration` it added via [WifiManager.addNetwork]
+     * and a snapshot of previously-enabled configs to re-enable on
+     * teardown.
+     */
+    private sealed class CameraNetworkJoin {
+        abstract val callback: ConnectivityManager.NetworkCallback
+
+        data class Modern(
+            override val callback: ConnectivityManager.NetworkCallback,
+        ) : CameraNetworkJoin()
+
+        data class Legacy(
+            override val callback: ConnectivityManager.NetworkCallback,
+            val addedNetId: Int,
+            val previouslyEnabledNetIds: List<Int>,
+        ) : CameraNetworkJoin()
+    }
+
+    /**
      * Atomically: join camera AP -> probe reachability -> fetch clip ->
      * release network request.
      *
      * Returns the size in bytes of the downloaded file.
      */
-    @RequiresApi(Build.VERSION_CODES.Q)
     suspend fun download(
         remoteFileURI: String,
         destination: File,
@@ -118,7 +197,7 @@ class Insta360WiFiDownloader(private val context: Context) {
         progress: (Double) -> Unit,
     ): Long {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val callback = applyNetworkSuggestion(cm, ssid, passphrase)
+        val join = applyCameraNetwork(cm, ssid, passphrase)
         try {
             val cameraHost = waitForReachability(cm)
             var written = 0L
@@ -131,11 +210,10 @@ class Insta360WiFiDownloader(private val context: Context) {
             }
             return written
         } finally {
-            releaseCameraNetwork(cm, callback)
+            releaseCameraNetwork(cm, join)
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
     suspend fun downloadBatch(
         ssid: String,
         passphrase: String,
@@ -145,7 +223,7 @@ class Insta360WiFiDownloader(private val context: Context) {
     ): List<BatchResult> {
         if (items.isEmpty()) return emptyList()
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val callback = applyNetworkSuggestion(cm, ssid, passphrase)
+        val join = applyCameraNetwork(cm, ssid, passphrase)
         return try {
             val cameraHost = waitForReachability(cm)
             items.map { item ->
@@ -170,23 +248,42 @@ class Insta360WiFiDownloader(private val context: Context) {
                 }
             }
         } finally {
-            releaseCameraNetwork(cm, callback)
+            releaseCameraNetwork(cm, join)
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
     suspend fun listFiles(
         ssid: String,
         passphrase: String,
     ): List<Insta360FileInfo> {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val callback = applyNetworkSuggestion(cm, ssid, passphrase)
+        val join = applyCameraNetwork(cm, ssid, passphrase)
         return try {
             waitForReachability(cm)
             fetchCameraFileInfoList()
         } finally {
             closeSdkWifiCamera()
-            releaseCameraNetwork(cm, callback)
+            releaseCameraNetwork(cm, join)
+        }
+    }
+
+    /**
+     * SDK_INT dispatcher. Q+ uses the app-scoped
+     * [WifiNetworkSpecifier] path via [applyNetworkSuggestion]; P falls
+     * back to the system-scoped [WifiManager.addNetwork] +
+     * [WifiManager.enableNetwork] flow via
+     * [applyNetworkSuggestionLegacy]. Both branches share the
+     * [waitForReachability] / [fetchResource] downstream pipeline.
+     */
+    private suspend fun applyCameraNetwork(
+        cm: ConnectivityManager,
+        ssid: String,
+        passphrase: String,
+    ): CameraNetworkJoin {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            CameraNetworkJoin.Modern(applyNetworkSuggestion(cm, ssid, passphrase))
+        } else {
+            applyNetworkSuggestionLegacy(cm, ssid, passphrase)
         }
     }
 
@@ -356,6 +453,244 @@ class Insta360WiFiDownloader(private val context: Context) {
             throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown")
         }
         return cb
+    }
+
+    /**
+     * Legacy (API 28) join flow. Mirrors [applyNetworkSuggestion]'s
+     * deadline + retry shape but uses the pre-Q
+     * [WifiManager.addNetwork] / [WifiManager.enableNetwork] +
+     * [ConnectivityManager.registerNetworkCallback] approach.
+     *
+     * UX caveats vs. the Q+ path (system-scoped, not app-scoped):
+     * - Briefly disconnects every app on the device from the user's
+     *   home Wi-Fi while we own the radio.
+     * - On teardown we re-enable previously-saved configs and call
+     *   `reconnect()`; the supplicant then picks the highest-priority
+     *   saved network. There is no platform guarantee the user's prior
+     *   network comes back immediately.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun applyNetworkSuggestionLegacy(
+        cm: ConnectivityManager,
+        ssid: String,
+        passphrase: String,
+    ): CameraNetworkJoin.Legacy {
+        val deadlineMs = SystemClock.elapsedRealtime() + Insta360WiFiReachabilityPolicy.joinTimeoutMs
+        var attempt = 1
+        var lastError: Throwable? = null
+        while (SystemClock.elapsedRealtime() < deadlineMs) {
+            val remainingMs = deadlineMs - SystemClock.elapsedRealtime()
+            val attemptTimeoutMs = minOf(
+                Insta360WiFiReachabilityPolicy.joinAttemptTimeoutMs,
+                remainingMs,
+            ).coerceAtLeast(1_000L)
+            try {
+                return requestCameraNetworkLegacyOnce(
+                    cm = cm,
+                    ssid = ssid,
+                    passphrase = passphrase,
+                    attempt = attempt,
+                    timeoutMs = attemptTimeoutMs,
+                )
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                lastError = t
+                val retryDelayMs = minOf(
+                    Insta360WiFiReachabilityPolicy.joinRetryDelayMs,
+                    deadlineMs - SystemClock.elapsedRealtime(),
+                )
+                if (retryDelayMs <= 0) break
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    level = InstaLogLevel.WARN,
+                    event = "camera_ap_join_retry_legacy",
+                    fields = mapOf(
+                        "ssid" to ssid,
+                        "attempt" to attempt,
+                        "retry_delay_ms" to retryDelayMs,
+                        "error" to (t.message ?: t::class.java.simpleName),
+                    ),
+                )
+                delay(retryDelayMs)
+                attempt += 1
+            }
+        }
+        throw Insta360Error.HotspotApplyFailed(
+            "camera AP unavailable for SSID=$ssid after ${Insta360WiFiReachabilityPolicy.joinTimeoutMs}ms [legacy]" +
+                (lastError?.message?.let { " ($it)" } ?: "")
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun requestCameraNetworkLegacyOnce(
+        cm: ConnectivityManager,
+        ssid: String,
+        passphrase: String,
+        attempt: Int,
+        timeoutMs: Long,
+    ): CameraNetworkJoin.Legacy {
+        val wifiManager = context.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: throw Insta360Error.HotspotApplyFailed("WIFI_SERVICE unavailable [legacy]")
+
+        val visibleTarget = logWifiScanSnapshot(
+            ssid = ssid,
+            phase = "before_request_legacy",
+            attempt = attempt,
+            hiddenSsid = false,
+        )
+        val hiddenSsid = !visibleTarget
+
+        val config = buildLegacyWifiConfiguration(ssid, passphrase, hiddenSsid)
+        val previouslyEnabledNetIds = runCatching {
+            wifiManager.configuredNetworks
+                ?.asSequence()
+                ?.filter { it.status != WifiConfiguration.Status.DISABLED }
+                ?.map { it.networkId }
+                ?.filter { it >= 0 }
+                ?.toList()
+                .orEmpty()
+        }.getOrDefault(emptyList())
+
+        val addedNetId = runCatching { wifiManager.addNetwork(config) }
+            .getOrDefault(-1)
+        if (addedNetId < 0) {
+            throw Insta360Error.HotspotApplyFailed(
+                "addNetwork returned $addedNetId for SSID=$ssid [legacy]"
+            )
+        }
+        InstaLog.log(
+            InstaLogCategory.WIFI,
+            event = "camera_ap_join_requested_legacy",
+            fields = mapOf(
+                "ssid" to ssid,
+                "attempt" to attempt,
+                "timeout_ms" to timeoutMs,
+                "hidden_ssid" to hiddenSsid,
+                "net_id" to addedNetId,
+                "previously_enabled_count" to previouslyEnabledNetIds.size,
+            ),
+        )
+
+        val enableOk = runCatching {
+            wifiManager.enableNetwork(addedNetId, /*disableOthers=*/true)
+        }.getOrDefault(false)
+        if (!enableOk) {
+            // `enableNetwork(_, disableOthers=true)` may have already
+            // disabled the user's saved networks before failing — fully
+            // restore so a single failed join doesn't leave the device
+            // unable to auto-reconnect to home Wi-Fi.
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "enable_network_failed",
+            )
+            throw Insta360Error.HotspotApplyFailed(
+                "enableNetwork returned false for netId=$addedNetId SSID=$ssid [legacy]"
+            )
+        }
+        runCatching { wifiManager.reconnect() }
+
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val onAvailable = CompletableDeferred<Network>()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val connected = runCatching { wifiManager.connectionInfo }.getOrNull()
+                if (!legacyConnectionMatchesTarget(connected?.ssid, ssid)) {
+                    InstaLog.log(
+                        InstaLogCategory.WIFI,
+                        level = InstaLogLevel.DEBUG,
+                        event = "camera_ap_join_available_ignored_legacy",
+                        fields = mapOf(
+                            "target_ssid" to ssid,
+                            "connected_ssid" to (connected?.ssid ?: ""),
+                            "attempt" to attempt,
+                        ),
+                    )
+                    return
+                }
+                cm.bindProcessToNetwork(network)
+                runCatching { Insta360OneSDKBridge.bindNetwork(network) }
+                logNetworkSnapshot(
+                    cm = cm,
+                    network = network,
+                    ssid = ssid,
+                    attempt = attempt,
+                    event = "camera_ap_join_available_network_legacy",
+                )
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    event = "camera_ap_join_available_legacy",
+                    fields = mapOf(
+                        "ssid" to ssid,
+                        "network" to network.networkHandle,
+                        "attempt" to attempt,
+                    ),
+                )
+                if (!onAvailable.isCompleted) onAvailable.complete(network)
+            }
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                logNetworkSnapshot(
+                    cm = cm,
+                    network = network,
+                    ssid = ssid,
+                    attempt = attempt,
+                    event = "camera_ap_link_properties_legacy",
+                    linkProperties = linkProperties,
+                )
+            }
+        }
+        runCatching { cm.registerNetworkCallback(request, cb) }
+            .onFailure { error ->
+                restoreLegacyWifiState(
+                    wifiManager = wifiManager,
+                    addedNetId = addedNetId,
+                    previouslyEnabledNetIds = previouslyEnabledNetIds,
+                    eventPrefix = "wifi_legacy_restore",
+                    phase = "register_callback_failed",
+                )
+                throw Insta360Error.HotspotApplyFailed(
+                    "registerNetworkCallback failed [legacy]: ${error.message}"
+                )
+            }
+        try {
+            withTimeoutOrNull(
+                timeoutMs + Insta360WiFiReachabilityPolicy.joinAwaitSlackMs,
+            ) { onAvailable.await() }
+                ?: throw Insta360Error.HotspotApplyFailed(
+                    "camera AP join timeout (${timeoutMs}ms) [legacy]"
+                )
+        } catch (t: CancellationException) {
+            runCatching { cm.unregisterNetworkCallback(cb) }
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "join_cancelled",
+            )
+            throw t
+        } catch (t: Throwable) {
+            runCatching { cm.unregisterNetworkCallback(cb) }
+            restoreLegacyWifiState(
+                wifiManager = wifiManager,
+                addedNetId = addedNetId,
+                previouslyEnabledNetIds = previouslyEnabledNetIds,
+                eventPrefix = "wifi_legacy_restore",
+                phase = "join_failed",
+            )
+            if (t is Insta360Error) throw t
+            throw Insta360Error.HotspotApplyFailed(t.message ?: "unknown [legacy]")
+        }
+        return CameraNetworkJoin.Legacy(
+            callback = cb,
+            addedNetId = addedNetId,
+            previouslyEnabledNetIds = previouslyEnabledNetIds,
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -1019,12 +1354,109 @@ class Insta360WiFiDownloader(private val context: Context) {
 
     private suspend fun releaseCameraNetwork(
         cm: ConnectivityManager,
-        callback: ConnectivityManager.NetworkCallback,
+        join: CameraNetworkJoin,
     ) {
         closeSdkWifiCamera()
         runCatching { cm.bindProcessToNetwork(null) }
-        runCatching { cm.unregisterNetworkCallback(callback) }
+        runCatching { cm.unregisterNetworkCallback(join.callback) }
+        if (join is CameraNetworkJoin.Legacy) {
+            releaseLegacyWifiConfiguration(join)
+        }
         awaitNetworkRestore(cm, Insta360WiFiReachabilityPolicy.restoreTimeoutMs)
+    }
+
+    /**
+     * Removes the [WifiConfiguration] we added in
+     * [applyNetworkSuggestionLegacy] and best-effort re-enables the
+     * caller's previously-saved networks so the supplicant can
+     * reconnect to the user's home Wi-Fi. Wraps the shared
+     * [restoreLegacyWifiState] helper with the `wifi_legacy_release_*`
+     * event prefix so successful-teardown telemetry stays distinct
+     * from `wifi_legacy_restore_*` events emitted on join-failure
+     * cleanup paths.
+     */
+    @SuppressLint("MissingPermission")
+    private fun releaseLegacyWifiConfiguration(join: CameraNetworkJoin.Legacy) {
+        val wifiManager = context.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        restoreLegacyWifiState(
+            wifiManager = wifiManager,
+            addedNetId = join.addedNetId,
+            previouslyEnabledNetIds = join.previouslyEnabledNetIds,
+            eventPrefix = "wifi_legacy_release",
+            phase = "release",
+        )
+    }
+
+    /**
+     * Removes the camera-AP [WifiConfiguration] we added via
+     * [WifiManager.addNetwork] and best-effort re-enables the saved
+     * configs that were enabled before
+     * `enableNetwork(_, disableOthers=true)` ran, then calls
+     * `reconnect()` so the supplicant can pick the highest-priority
+     * saved network. Every step is wrapped in [runCatching] because
+     * OEM Wi-Fi stacks on P frequently return `false` for transient
+     * reasons.
+     *
+     * Used by both the successful-teardown path
+     * ([releaseLegacyWifiConfiguration]) and the four failure paths
+     * inside [requestCameraNetworkLegacyOnce] (enableNetwork
+     * returning false, registerNetworkCallback throwing, join await
+     * cancellation, join await throwing). The `eventPrefix` keeps the
+     * two telemetry streams distinguishable in production logs.
+     */
+    @SuppressLint("MissingPermission")
+    private fun restoreLegacyWifiState(
+        wifiManager: WifiManager?,
+        addedNetId: Int,
+        previouslyEnabledNetIds: List<Int>,
+        eventPrefix: String,
+        phase: String,
+    ) {
+        if (wifiManager == null) {
+            InstaLog.log(
+                InstaLogCategory.WIFI,
+                level = InstaLogLevel.WARN,
+                event = "${eventPrefix}_no_manager",
+                fields = mapOf(
+                    "net_id" to addedNetId,
+                    "phase" to phase,
+                ),
+            )
+            return
+        }
+        val removed = runCatching { wifiManager.removeNetwork(addedNetId) }
+            .getOrElse { error ->
+                InstaLog.log(
+                    InstaLogCategory.WIFI,
+                    level = InstaLogLevel.WARN,
+                    event = "${eventPrefix}_remove_failed",
+                    fields = mapOf(
+                        "net_id" to addedNetId,
+                        "phase" to phase,
+                        "error" to (error.message ?: error::class.java.simpleName),
+                    ),
+                )
+                false
+            }
+        val restored = mutableListOf<Int>()
+        for (netId in previouslyEnabledNetIds) {
+            val ok = runCatching { wifiManager.enableNetwork(netId, /*disableOthers=*/false) }
+                .getOrDefault(false)
+            if (ok) restored += netId
+        }
+        runCatching { wifiManager.reconnect() }
+        InstaLog.log(
+            InstaLogCategory.WIFI,
+            event = "${eventPrefix}_done",
+            fields = mapOf(
+                "net_id" to addedNetId,
+                "phase" to phase,
+                "removed" to removed,
+                "restored_net_ids" to restored,
+                "previously_enabled_count" to previouslyEnabledNetIds.size,
+            ),
+        )
     }
 
     private suspend fun awaitNetworkRestore(cm: ConnectivityManager, maxWaitMs: Long) {
