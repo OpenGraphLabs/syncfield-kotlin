@@ -7,7 +7,7 @@ class SyncFieldVersionTest {
 
     @Test
     fun `current SDK version is the latest stable release`() {
-        assertThat(SyncFieldVersion.current).isEqualTo("0.4.0")
+        assertThat(SyncFieldVersion.current).isEqualTo("0.6.0")
         assertThat(SyncFieldVersion.current).doesNotContain("SNAPSHOT")
     }
 }

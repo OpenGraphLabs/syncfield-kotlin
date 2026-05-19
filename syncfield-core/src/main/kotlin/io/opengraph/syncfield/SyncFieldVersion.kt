@@ -7,5 +7,5 @@ package io.opengraph.syncfield
  * the core release.
  */
 object SyncFieldVersion {
-    const val current: String = "0.4.0"
+    const val current: String = "0.6.0"
 }
