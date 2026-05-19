@@ -9,12 +9,14 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        // 29: `WifiNetworkSpecifier` (the supported way to join the
-        // camera AP for clip downloads) is API 29+. Pre-29 only has
-        // the deprecated `WifiManager.enableNetwork`, which was
-        // removed for app-side use in Android 10. Other syncfield
-        // modules stay at API 26 — only Insta360 needs this floor.
-        minSdk = 29
+        // 28: `Insta360WiFiDownloader` joins the camera AP via the
+        // app-scoped `WifiNetworkSpecifier` path on Q+, and falls
+        // back to the legacy `WifiManager.addNetwork` + `enableNetwork`
+        // + `bindProcessToNetwork` flow on P. The legacy path is
+        // system-scoped (it briefly takes over the device Wi-Fi)
+        // and best-effort restores the previous SSID on cleanup;
+        // see `Insta360WiFiDownloader.applyNetworkSuggestionLegacy`.
+        minSdk = 28
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }
