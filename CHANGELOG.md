@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] — 2026-05-19
+
+Brings Android IMU + camera intrinsics surface area to iOS `syncfield-swift` 0.10.0 parity. The motivating downstream change is og-skill's 3D head/camera/hand pose pipeline (`og-skill/pipeline`): every IMU-based VIO backend (ORB-SLAM3 mono-inertial, OpenVINS/GTSAM, VGGT-IMU) needs raw specific-force (gravity included), raw gyro, and magnetometer values to recover gravity direction, metric scale, and absolute yaw. The previous `AndroidMotionStream` fused stream stripped gravity (TYPE_LINEAR_ACCELERATION) and never wired magnetometer, so Android recordings were unusable for those backends. This release fixes that by mirroring iOS's per-sensor file layout and JSONL schema.
+
+### Added
+- **`AndroidRawAccelStream`** (`imu_accel_raw.jsonl`) — raw accelerometer with gravity included. Uses `Sensor.TYPE_ACCELEROMETER` (NOT `TYPE_LINEAR_ACCELERATION`). Equivalent of iOS `iPhoneRawAccelStream`.
+- **`AndroidRawGyroStream`** (`imu_gyro_raw.jsonl`) — raw gyroscope (`Sensor.TYPE_GYROSCOPE`). Equivalent of iOS `iPhoneRawGyroStream`.
+- **`AndroidRawMagStream`** (`imu_mag_raw.jsonl`) — magnetometer (`Sensor.TYPE_MAGNETIC_FIELD`, μT). Equivalent of iOS `iPhoneRawMagStream`. Enables absolute-yaw bind so VIO doesn't drift over long recordings.
+- **`DeliveredCameraIntrinsics`** — data class mirroring the iOS struct of the same name. Carries `fx/fy/cx/cy/sampleWidth/sampleHeight/frameIndex` plus a `source` tag (`LENS_INTRINSIC_CALIBRATION` or `FOCAL_LENGTH_FALLBACK`).
+- **`AndroidCameraStream.setIntrinsicMatrixHandler(handler)`** — fires once from `connect()` after camera selection with the resolved intrinsics. The handler prefers `CameraCharacteristics.LENS_INTRINSIC_CALIBRATION` (scaled from active-array pixels to the output frame); if that's `null` (common on Samsung/Xiaomi devices) it falls back to `LENS_INFO_AVAILABLE_FOCAL_LENGTHS.min()` + `SENSOR_INFO_PHYSICAL_SIZE` and the pinhole formula `fx = focal_mm × outputW / sensorW`. Mirrors iOS `iPhoneCameraStream.setIntrinsicMatrixHandler`.
+
+### Changed (breaking)
+- **`SensorWriter` row schema rename to match iOS:** `frame` → `frame_number`, `timestamp_ns` → `capture_ns`. The optional `device_timestamp_ns` field is unchanged. JSONL row keys are still sorted alphabetically, so the new top-level key order is `capture_ns < channels < device_timestamp_ns < frame_number`.
+- **`StreamWriter` row schema rename to match iOS:** `frame` → `frame_number`, `timestamp_ns` → `capture_ns`. Affects `<streamId>.timestamps.jsonl` written by `AndroidCameraStream`. Downstream consumers (notably `og-skill/pipeline/src/slam_vio/io.py`) already expected this iOS shape, so the rename eliminates the iOS-vs-Android schema split.
+- **`AndroidMotionStream` renamed to `AndroidDeviceMotionStream`** and the default `streamId` switched from `"imu"` to `"imu_devmotion"`. The class still subscribes to `TYPE_LINEAR_ACCELERATION + TYPE_GYROSCOPE + TYPE_GRAVITY`; this is the Android analog of iOS `iPhoneMotionStream` (`CMDeviceMotion.userAcceleration + rotationRate + gravity`). Apps that want VIO-compatible raw specific-force should add `AndroidRawAccelStream` alongside this; apps that want fused gravity-free user acceleration keep using `AndroidDeviceMotionStream`.
+
+### Compatibility
+- Host migration steps for og-skill (separate PR, syncFieldSdkVersion 0.6.0 → 0.7.0):
+  1. Rename `AndroidMotionStream` references to `AndroidDeviceMotionStream`, set `streamId = "imu_devmotion"`.
+  2. Add three new stream registrations: `AndroidRawAccelStream` / `AndroidRawGyroStream` / `AndroidRawMagStream`, all `rateHz = 100`. Mirrors the iOS bridge module's IMU block.
+  3. Wire `setIntrinsicMatrixHandler` on `AndroidCameraStream` to a `CameraIntrinsicsWriter` mirror of the iOS Swift class so `camera_intrinsics.json` lands on disk in the same schema.
+- Existing Android recording sessions (0.6.0 and earlier) still upload, but their `imu.jsonl` plus the older `frame` / `timestamp_ns` key names will need a one-off remapping if you want to re-run them through `og-skill/pipeline` post-0.7.0.
+
+### Tests
+- New `AndroidRawSensorStreamTest` (`syncfield-streams/src/test`): Robolectric-driven coverage of the three raw stream defaults + channel-map shape, plus a cross-stream test that confirms no fusion leakage across sensor types.
+- New `AndroidCameraIntrinsicsTest` (`syncfield-streams/src/test`): pure-JVM coverage of both compute paths (lens-calibration scaling, focal-length pinhole) and their degenerate-input rejection.
+- `WritersTest` updated for the iOS schema keys (`capture_ns` / `frame_number`).
+- Whole-SDK `./gradlew test` green after migration.
+
 ## [0.6.0] — 2026-05-19
 
 Stabilizes egocentric Android capture frame rate when the host installs a heavy frame processor. Mirrors `syncfield-swift` 0.10.0 for cross-platform parity. The frame-processor closure signature changes from `(ImageProxy, Int) -> Unit` to `(FrameSnapshot) -> Unit` — host apps must update their callsite (one-line change for `og-skill`).

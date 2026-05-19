@@ -172,7 +172,10 @@ normal builds and reserve composite builds for active SDK development.
 import io.opengraph.syncfield.*
 import io.opengraph.syncfield.audio.AudioTrackChirpPlayer
 import io.opengraph.syncfield.streams.AndroidCameraStream
-import io.opengraph.syncfield.streams.AndroidMotionStream
+import io.opengraph.syncfield.streams.AndroidDeviceMotionStream
+import io.opengraph.syncfield.streams.AndroidRawAccelStream
+import io.opengraph.syncfield.streams.AndroidRawGyroStream
+import io.opengraph.syncfield.streams.AndroidRawMagStream
 import io.opengraph.syncfield.tactile.TactileSide
 import io.opengraph.syncfield.tactile.TactileStream
 import java.io.File
@@ -194,12 +197,18 @@ class RecordingActivity : AppCompatActivity() {
             lifecycleOwner = this,
             streamId = "cam_ego",
         )
-        val imu = AndroidMotionStream(this, streamId = "imu", rateHz = 100)
+        val devmotion = AndroidDeviceMotionStream(this, streamId = "imu_devmotion", rateHz = 100)
+        val accel = AndroidRawAccelStream(this, streamId = "imu_accel_raw", rateHz = 100)
+        val gyro = AndroidRawGyroStream(this, streamId = "imu_gyro_raw", rateHz = 100)
+        val mag = AndroidRawMagStream(this, streamId = "imu_mag_raw", rateHz = 100)
         val left = TactileStream(this, "tactile_left", TactileSide.Left)
 
         lifecycleScope.launch {
             orchestrator.add(cam)
-            orchestrator.add(imu)
+            orchestrator.add(devmotion)
+            orchestrator.add(accel)
+            orchestrator.add(gyro)
+            orchestrator.add(mag)
             orchestrator.add(left)
             orchestrator.connect()
 

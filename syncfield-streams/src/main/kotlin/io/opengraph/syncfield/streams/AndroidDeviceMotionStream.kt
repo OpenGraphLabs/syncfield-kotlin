@@ -26,21 +26,31 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 /**
- * Android equivalent of `iPhoneMotionStream`. Subscribes to
- * `TYPE_LINEAR_ACCELERATION`, `TYPE_GYROSCOPE`, and `TYPE_GRAVITY`,
- * fuses the latest values into one row per gyroscope event, and
- * writes them via [SensorWriter] in the same channel layout the
- * Swift stream uses (accel_*, gyro_*, gravity_*).
+ * Android equivalent of `iPhoneMotionStream` (a.k.a. iOS `imu_devmotion`).
+ * Subscribes to `TYPE_LINEAR_ACCELERATION`, `TYPE_GYROSCOPE`, and
+ * `TYPE_GRAVITY`, fuses the latest values into one row per gyroscope
+ * event, and writes them via [SensorWriter] in the same channel layout
+ * the Swift stream uses (accel_*, gyro_*, gravity_*).
+ *
+ * Channel semantics map to iOS `CMDeviceMotion` 1:1:
+ *  - `accel_*`   = TYPE_LINEAR_ACCELERATION = userAcceleration (gravity removed)
+ *  - `gyro_*`    = TYPE_GYROSCOPE           = rotationRate
+ *  - `gravity_*` = TYPE_GRAVITY             = gravity
+ *
+ * For raw accelerometer (with gravity), raw gyroscope, and raw magnetometer
+ * streams, use [AndroidRawAccelStream], [AndroidRawGyroStream], and
+ * [AndroidRawMagStream] respectively — these are the analogs of iOS
+ * `imu_accel_raw`, `imu_gyro_raw`, and `imu_mag_raw`.
  *
  * `SensorEvent.timestamp` is in the same monotonic domain as
  * `System.nanoTime()` (both are `clock_gettime(CLOCK_MONOTONIC)` under
- * the hood), so we copy it straight into `timestamp_ns` without any
+ * the hood), so we copy it straight into `capture_ns` without any
  * conversion. This matches what `iPhoneMotionStream` does on iOS,
  * where `CMDeviceMotion.timestamp` is already in mach absolute time.
  */
-class AndroidMotionStream(
+class AndroidDeviceMotionStream(
     private val context: Context,
-    override val streamId: String = "imu",
+    override val streamId: String = "imu_devmotion",
     private val rateHz: Int = 100,
 ) : SyncFieldStream {
 

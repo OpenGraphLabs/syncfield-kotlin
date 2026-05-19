@@ -26,11 +26,12 @@ class WritersTest {
 
         val lines = file.readLines()
         assertThat(lines).hasSize(2)
+        // iOS parity: capture_ns / frame_number / uncertainty_ns (alphabetical)
         assertThat(lines[0]).isEqualTo(
-            """{"frame":0,"timestamp_ns":1000,"uncertainty_ns":500}"""
+            """{"capture_ns":1000,"frame_number":0,"uncertainty_ns":500}"""
         )
         assertThat(lines[1]).isEqualTo(
-            """{"frame":1,"timestamp_ns":2000,"uncertainty_ns":500}"""
+            """{"capture_ns":2000,"frame_number":1,"uncertainty_ns":500}"""
         )
         assertThat(writer.count).isEqualTo(2)
     }
@@ -49,11 +50,12 @@ class WritersTest {
         writer.close()
 
         val line = file.readLines().single()
-        // Top-level: channels < device_timestamp_ns < frame < timestamp_ns
+        // iOS parity (capture_ns / frame_number).
+        // Top-level alphabetical: capture_ns < channels < device_timestamp_ns < frame_number
         // Channel inner: accel_x < accel_y < gyro_z
         assertThat(line).isEqualTo(
-            """{"channels":{"accel_x":0.2,"accel_y":0.3,"gyro_z":0.1},""" +
-            """"device_timestamp_ns":999,"frame":7,"timestamp_ns":12345}"""
+            """{"capture_ns":12345,"channels":{"accel_x":0.2,"accel_y":0.3,"gyro_z":0.1},""" +
+            """"device_timestamp_ns":999,"frame_number":7}"""
         )
     }
 

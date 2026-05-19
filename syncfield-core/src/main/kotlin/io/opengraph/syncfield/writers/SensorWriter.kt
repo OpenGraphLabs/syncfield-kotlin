@@ -14,7 +14,7 @@ import java.io.FileOutputStream
  *
  * Each row matches the Swift writer's schema:
  * ```
- * {"frame":N,"timestamp_ns":NS,"channels":{...},"device_timestamp_ns":NS?}
+ * {"frame_number":N,"capture_ns":NS,"channels":{...},"device_timestamp_ns":NS?}
  * ```
  */
 class SensorWriter(file: File) {
@@ -36,9 +36,9 @@ class SensorWriter(file: File) {
             .associate { it.key to anyToJson(it.value) }
 
         val rowBuilder = mutableMapOf<String, JsonElement>(
+            "capture_ns"   to JsonPrimitive(monotonicNs),
             "channels"     to JsonObject(sortedChannels),
-            "frame"        to JsonPrimitive(frame),
-            "timestamp_ns" to JsonPrimitive(monotonicNs),
+            "frame_number" to JsonPrimitive(frame),
         )
         if (deviceTimestampNs != null) {
             rowBuilder["device_timestamp_ns"] = JsonPrimitive(deviceTimestampNs)

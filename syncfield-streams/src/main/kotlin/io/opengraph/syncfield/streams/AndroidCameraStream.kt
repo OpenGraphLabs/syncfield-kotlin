@@ -146,6 +146,17 @@ class AndroidCameraStream @JvmOverloads constructor(
     @Volatile private var lastProcessorCallNs: Long = 0L
 
     /**
+     * Set by [setIntrinsicMatrixHandler]. Fired once per camera-open from
+     * [connect] after the back camera has been selected and pinned, so the
+     * app can write `camera_intrinsics.json`. Mirrors iOS
+     * `iPhoneCameraStream.setIntrinsicMatrixHandler` — but where iOS fires
+     * per sample buffer (intrinsics can change with active-format / zoom
+     * switches), Android's lens config is effectively fixed for the
+     * recording so one delivery per `connect` is enough.
+     */
+    @Volatile private var intrinsicsHandler: ((DeliveredCameraIntrinsics) -> Unit)? = null
+
+    /**
      * Off-thread dispatch for the host-supplied frame processor.
      *
      * Without this gate the processor closure would run inline on the
@@ -186,6 +197,12 @@ class AndroidCameraStream @JvmOverloads constructor(
         withContext(Dispatchers.Main) {
             cameraProvider = obtainCameraProvider()
             selectAndPinWidestBackCamera()
+            // Compute intrinsics once we know which physical camera will
+            // back the recording. Skipped silently if no handler is set,
+            // or if the pinned selection couldn't be resolved — the app's
+            // estimated FOV fallback still produces a JSON sidecar in that
+            // case.
+            deliverIntrinsicsIfPossible()
             configureUseCases()
             // We intentionally do NOT bindToLifecycle here. CameraX 1.3.x
             // does not reliably start preview frames when
@@ -460,6 +477,79 @@ class AndroidCameraStream @JvmOverloads constructor(
     private fun physicalCameraIds(chars: CameraCharacteristics): Set<String> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return emptySet()
         return runCatching { chars.physicalCameraIds }.getOrDefault(emptySet())
+    }
+
+    /**
+     * Register a callback for camera intrinsics. Fired once from [connect]
+     * after camera selection completes. Mirrors iOS
+     * `iPhoneCameraStream.setIntrinsicMatrixHandler`. Pass `null` to clear.
+     *
+     * The callback may run on the main thread; do not block. To write to
+     * disk, dispatch to an IO scope from the closure.
+     */
+    fun setIntrinsicMatrixHandler(handler: ((DeliveredCameraIntrinsics) -> Unit)?) {
+        intrinsicsHandler = handler
+    }
+
+    /**
+     * Resolve `CameraCharacteristics` for the pinned selection, run the
+     * pure compute helpers in priority order
+     * ([computeIntrinsicsFromLensCalibration] → [computeIntrinsicsFromFocalLength]),
+     * and invoke [intrinsicsHandler] with the first non-null result. Silent
+     * no-op if no handler is set, if no characteristics could be read, or
+     * if both compute paths failed (the app retains its own FOV-estimate
+     * fallback).
+     */
+    private fun deliverIntrinsicsIfPossible() {
+        val handler = intrinsicsHandler ?: return
+        val selection = pinnedSelection ?: return
+        // Prefer the physical id when one was pinned (sub-physical
+        // ultra-wide), otherwise the logical id we'll bind to.
+        val cameraId = selection.physicalCameraId ?: selection.logicalCameraId
+        val cameraManager = runCatching {
+            context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+        }.getOrNull() ?: return
+        val chars = runCatching {
+            cameraManager.getCameraCharacteristics(cameraId)
+        }.getOrNull() ?: return
+
+        val outW = videoSettings.width
+        val outH = videoSettings.height
+
+        val activeArray = chars[CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE]
+        val lensCalib = chars[CameraCharacteristics.LENS_INTRINSIC_CALIBRATION]
+        val viaCalib = if (lensCalib != null && activeArray != null) {
+            computeIntrinsicsFromLensCalibration(
+                calibration = lensCalib,
+                activeArrayWidth = activeArray.width(),
+                activeArrayHeight = activeArray.height(),
+                outputWidth = outW,
+                outputHeight = outH,
+            )
+        } else null
+
+        val result = viaCalib ?: run {
+            val focal = chars[CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS]?.minOrNull()
+            val sensorSize = chars[CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE]
+            if (focal != null && sensorSize != null) {
+                computeIntrinsicsFromFocalLength(
+                    minFocalLengthMm = focal,
+                    sensorWidthMm = sensorSize.width,
+                    sensorHeightMm = sensorSize.height,
+                    outputWidth = outW,
+                    outputHeight = outH,
+                )
+            } else null
+        } ?: return
+
+        Log.i(
+            TAG,
+            "intrinsics delivered cameraId=$cameraId source=${result.source} " +
+                "fx=${"%.1f".format(result.fx)} fy=${"%.1f".format(result.fy)} " +
+                "cx=${"%.1f".format(result.cx)} cy=${"%.1f".format(result.cy)} " +
+                "@${result.sampleWidth}x${result.sampleHeight}",
+        )
+        runCatching { handler(result) }
     }
 
     private fun candidateFromCharacteristics(

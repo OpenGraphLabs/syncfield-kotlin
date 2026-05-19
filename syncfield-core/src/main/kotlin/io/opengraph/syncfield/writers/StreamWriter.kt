@@ -14,7 +14,7 @@ import java.io.FileOutputStream
  *
  * Each row matches the Swift writer's schema:
  * ```
- * {"frame":N,"timestamp_ns":NS,"uncertainty_ns":NS}
+ * {"frame_number":N,"capture_ns":NS,"uncertainty_ns":NS}
  * ```
  *
  * `append` is serialised through a coroutine [Mutex] so concurrent
@@ -31,8 +31,8 @@ class StreamWriter(file: File) {
     suspend fun append(frame: Int, monotonicNs: Long, uncertaintyNs: Long) {
         val row = JsonObject(
             mapOf(
-                "frame"          to JsonPrimitive(frame),
-                "timestamp_ns"   to JsonPrimitive(monotonicNs),
+                "capture_ns"     to JsonPrimitive(monotonicNs),
+                "frame_number"   to JsonPrimitive(frame),
                 "uncertainty_ns" to JsonPrimitive(uncertaintyNs),
             ).toSortedMap()
         )
