@@ -29,6 +29,29 @@ sealed interface HealthEvent {
         val error: Throwable,
     ) : HealthEvent
 
+    // --- Audio-interruption health events (v0.7.1, additive) ---
+    //
+    // Emitted by AndroidCameraStream when CameraX's
+    // RecordingStats.audioStats.audioState transitions across the
+    // ACTIVE / SOURCE_SILENCED / SOURCE_ERROR / ENCODER_ERROR boundary
+    // during a recording. Mirrors syncfield-swift's iPhoneCameraStream
+    // audio watchdog so JS hosts see the same shape on both platforms.
+    //
+    // The SDK does NOT attempt active recovery on interruption — these
+    // events are observational only. Hosts decide whether to surface a
+    // UI banner, log telemetry, or guide the user to restart.
+
+    /** Audio capture has gone silent on a stream that previously had active audio. */
+    data class AudioStalled(
+        override val streamId: String,
+        val silentForSeconds: Double,
+    ) : HealthEvent
+
+    /** Audio capture has returned to active after a prior stall on the same stream. */
+    data class AudioRecovered(
+        override val streamId: String,
+    ) : HealthEvent
+
     // --- Insta360-specific health events (v0.5.0, additive) ---
 
     /** Connection state transition emitted by `Insta360CameraSupervisor`. */

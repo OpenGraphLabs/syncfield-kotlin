@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.1] — 2026-05-19
+
+Adds passive audio-interruption observability to `AndroidCameraStream`, mirroring the audio-recovery health events `syncfield-swift` 0.10.0 ships on iOS. iOS shipped an active recovery path (re-attaching `AVCaptureAudioDataOutput` on `AVAudioSession.interruptionNotification.ended`); Android cannot mirror that because CameraX abstracts the audio source and active recovery would risk the single-file invariant downstream pipelines rely on. Instead the SDK surfaces the two health events JS already consumes, and the host app decides how to react.
+
+### Added
+- **`HealthEvent.AudioStalled(streamId, silentForSeconds)`** and **`HealthEvent.AudioRecovered(streamId)`** — additive sealed-interface variants. Payload matches the iOS `HealthEvent` cases of the same name so the React Native bridge can forward both platforms through one channel.
+- **`AudioStateTracker`** (`syncfield-streams`) — pure-Kotlin state machine that translates CameraX `AudioStats.audioState` transitions (`ACTIVE` ↔ `SOURCE_SILENCED` / `SOURCE_ERROR` / `ENCODER_ERROR`) into the new health events. `DISABLED` is a baseline no-op so revoked-mic-permission sessions don't emit spurious events.
+- **`AndroidCameraStream` Status branch** — the previously dropped `VideoRecordEvent.Status` case now feeds `audioState` into `AudioStateTracker` and publishes resulting events through the existing `HealthBus`. The tracker is reset at `startRecording`, `stopRecording`, and `disconnect`. Fire-and-forget `ioScope.launch` is safe because `HealthBus` is `DROP_OLDEST`.
+
+### Not changed
+- Recording lifecycle (`startRecording` / `stopRecording` start/stop semantics, the single-file invariant, frame-processor gate, ingest path) — none of these touched.
+- iOS `AVAudioSession`-style active recovery — explicitly out of scope on Android (OEM-dependent `Recording.pause()/resume()` and stop/restart both break the single-file invariant).
+- `AudioManager.registerAudioRecordingCallback` backup signal — deferred until field data shows `audioState` misses transitions.
+
+### Tests
+- New `AudioStateTrackerTest` (`syncfield-streams/src/test`): pure-JVM coverage of every transition, including idempotence across same-state ticks, error-state aliasing, recover-restall sequences, and reset semantics.
+- `SyncFieldVersionTest` bumped to track the new `current`.
+- Whole-SDK `./gradlew test` green.
+
 ## [0.7.0] — 2026-05-19
 
 Brings Android IMU + camera intrinsics surface area to iOS `syncfield-swift` 0.10.0 parity. The motivating downstream change is og-skill's 3D head/camera/hand pose pipeline (`og-skill/pipeline`): every IMU-based VIO backend (ORB-SLAM3 mono-inertial, OpenVINS/GTSAM, VGGT-IMU) needs raw specific-force (gravity included), raw gyro, and magnetometer values to recover gravity direction, metric scale, and absolute yaw. The previous `AndroidMotionStream` fused stream stripped gravity (TYPE_LINEAR_ACCELERATION) and never wired magnetometer, so Android recordings were unusable for those backends. This release fixes that by mirroring iOS's per-sensor file layout and JSONL schema.

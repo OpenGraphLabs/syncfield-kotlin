@@ -128,6 +128,7 @@ class AndroidCameraStream @JvmOverloads constructor(
 
     private var recording: Recording? = null
     private var recordingFinalize: CompletableDeferred<VideoRecordEvent.Finalize>? = null
+    private val audioStateTracker = AudioStateTracker(streamId)
     private var stampWriter: StreamWriter? = null
     @Volatile private var frameCount: Int = 0
     @Volatile private var isRecording: Boolean = false
@@ -725,6 +726,7 @@ class AndroidCameraStream @JvmOverloads constructor(
         this.clock = clock
         stampWriter = writerFactory.makeStreamWriter(streamId)
         frameCount = 0
+        audioStateTracker.reset()
 
         val output = writerFactory.videoFile(streamId, "mp4")
         if (output.exists()) output.delete()
@@ -777,6 +779,20 @@ class AndroidCameraStream @JvmOverloads constructor(
                             }
                         }
                     }
+                    is VideoRecordEvent.Status -> {
+                        // CameraX surfaces mic-source state changes
+                        // (call interrupt, voice-assistant capture, codec
+                        // error) through `recordingStats.audioStats`.
+                        // Translate transitions across the stall boundary
+                        // into health events; do NOT attempt active
+                        // recovery — the recording lifecycle is otherwise
+                        // unchanged. fire-and-forget through ioScope is
+                        // safe because HealthBus uses DROP_OLDEST.
+                        val audioState = event.recordingStats.audioStats.audioState
+                        audioStateTracker.update(audioState, System.nanoTime())?.let { healthEvent ->
+                            ioScope.launch { healthBus?.publish(healthEvent) }
+                        }
+                    }
                     else -> Unit
                 }
             }
@@ -824,6 +840,7 @@ class AndroidCameraStream @JvmOverloads constructor(
 
         runCatching { stampWriter?.close() }
         stampWriter = null
+        audioStateTracker.reset()
 
         return StreamStopReport(streamId, frameCount = frameCount, kind = "video")
     }
@@ -857,6 +874,7 @@ class AndroidCameraStream @JvmOverloads constructor(
         // gate is idle.
         processorGate.drain()
         processorGate.shutdown()
+        audioStateTracker.reset()
         healthBus?.publish(HealthEvent.StreamDisconnected(streamId, "normal"))
     }
 
