@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-05-19
+
+Stabilizes egocentric Android capture frame rate when the host installs a heavy frame processor. Mirrors `syncfield-swift` 0.10.0 for cross-platform parity. The frame-processor closure signature changes from `(ImageProxy, Int) -> Unit` to `(FrameSnapshot) -> Unit` — host apps must update their callsite (one-line change for `og-skill`).
+
+### Fixed
+- **`AndroidCameraStream` frame processor no longer blocks the camera analyzer thread.** Before 0.6.0 the closure installed via `setFrameProcessor(throttleHz, body)` ran inline on the single-threaded `cameraExecutor` that CameraX's `ImageAnalysis` uses for its analyzer callback. Because the analyzer is built with `STRATEGY_KEEP_ONLY_LATEST` (the right default for real-time capture), any processor call that exceeded the inter-frame budget (~33 ms at 30 fps) caused CameraX to silently drop the next incoming sample. Hosts with on-device inference workloads — og-skill's MediaPipe hand-landmarker pipeline being the production case — were exposed to the same FPS-collapse failure mode that hit the iPhone pipeline through 2026-05-18 (`cam_ego.timestamps.jsonl` showed bimodal "33 ms vs 67 ms" inter-frame gap signatures and within-session drop rates climbing 20 % → 75 % with thermal throttling on iOS; the Android pipeline shape is structurally identical).
+- The analyzer thread now does one small piece of work per frame: `ImageProxy.toBitmap()` (a memcpy under the `OUTPUT_IMAGE_FORMAT_RGBA_8888` path the SDK already pins, well under the inter-frame budget). The resulting `FrameSnapshot` is dispatched through a new `FrameProcessorGate` to a dedicated single-thread executor (`syncfield-camera-processor`). When a prior dispatch is still running, new snapshots are dropped on the producer side rather than letting CameraX silently drop frames downstream. The CameraX buffer-pool slot is released as the analyzer callback returns, so capture continues at the native 30 fps regardless of detector latency.
+- `stopRecording` and `disconnect` now `drain()`/`shutdown()` the gate before returning, so hosts can rely on "stopRecording resolved ⇒ no more processor callbacks" for their own teardown (og-skill's bridge releases `AndroidHandDetectionEngine` immediately after stop).
+
+### Changed (breaking)
+- **`AndroidCameraStream.setFrameProcessor` signature:** the closure now receives a single `FrameSnapshot` parameter instead of `(ImageProxy, Int)`. The snapshot bundles the captured `Bitmap`, frame index, capture timestamp, and rotation hint — all the fields the previous host code read off the `ImageProxy`. The SDK owns the bitmap; hosts must not recycle it or hold references past the closure return. See KDoc on `FrameSnapshot`.
+- Rationale for the breaking change: an `ImageProxy` is a handle into CameraX's buffer pool; deferring its `close()` until the processor finishes would defeat the off-thread fix (the next analyzer callback can't fire until the proxy is closed). Snapshotting to a `Bitmap` on the analyzer thread, then closing the proxy as usual, is the canonical CameraX ML-pipeline pattern.
+- `syncFieldReleaseVersion` bumped to `0.6.0`.
+
+### Compatibility
+- Host migration is a one-line change: `setFrameProcessor(throttleHz = X) { proxy, _ -> ... proxy.something ... }` → `setFrameProcessor(throttleHz = X) { snapshot -> ... snapshot.bitmap / snapshot.frameIndex / snapshot.timestampNs / snapshot.rotationDegrees ... }`.
+- Drop-on-busy applies even with `throttleHz = 0`. A closure that occasionally exceeds the inter-frame budget will skip samples instead of holding up the analyzer — this matches what CameraX was already doing silently, and is the contract that makes stateful detectors (MediaPipe `.video` mode, ML Kit's persistent trackers) safe.
+
+### Tests
+- New `FrameProcessorGateTest` (`syncfield-streams/src/test`): pure-JVM coverage of dispatch / drop-on-busy / drain / shutdown / repeated-enqueue / under-load serialization. 8 cases, runs in `./gradlew :syncfield-streams:testDebugUnitTest` without an emulator.
+- Existing `syncfield-streams` tests (`VideoSettingsTest`, `CameraFovScoringTest`, `CameraSelectionResultTest`, `CameraUseCaseRotationPolicyTest`) continue to pass — 20 → 28 cases total in the module.
+
 ## [0.5.0] — 2026-05-17
 
 ### Added

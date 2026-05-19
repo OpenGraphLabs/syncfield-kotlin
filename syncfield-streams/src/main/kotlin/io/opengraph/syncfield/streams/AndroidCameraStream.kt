@@ -141,9 +141,28 @@ class AndroidCameraStream @JvmOverloads constructor(
     private var outputFile: File? = null
     private var clock: SessionClock? = null
 
-    private var frameProcessor: ((ImageProxy, Int) -> Unit)? = null
+    private var frameProcessor: ((FrameSnapshot) -> Unit)? = null
     @Volatile private var throttleHz: Double = 0.0
     @Volatile private var lastProcessorCallNs: Long = 0L
+
+    /**
+     * Off-thread dispatch for the host-supplied frame processor.
+     *
+     * Without this gate the processor closure would run inline on the
+     * analyzer thread; with `STRATEGY_KEEP_ONLY_LATEST` set on
+     * [ImageAnalysis] any call exceeding the inter-frame budget (~33 ms
+     * at 30 fps) makes CameraX silently drop the next sample. Heavy
+     * detectors (MediaPipe hand landmarker, ML Kit, custom Vision)
+     * routinely cross that line during egocentric capture — production
+     * data from the iOS twin of this pipeline showed the ego mp4
+     * collapsing to 8–20 fps under exactly this pattern.
+     *
+     * The gate enforces *drop-on-busy*: when a prior dispatch is still
+     * running the new sample is rejected without queueing, mirroring
+     * the analyzer-side policy so backpressure can't accumulate while
+     * the detector recovers from a slow frame.
+     */
+    private val processorGate = FrameProcessorGate()
 
     /**
      * Hand-off accessor for [io.opengraph.syncfield.ui.SyncFieldPreviewView]
@@ -680,6 +699,12 @@ class AndroidCameraStream @JvmOverloads constructor(
 
     override suspend fun stopRecording(): StreamStopReport {
         isRecording = false
+        // Drain any in-flight frame-processor work so the last callback
+        // returns before we finalize the recording. Host apps (og-skill)
+        // tear down their detector engine immediately after
+        // [stopRecording] resolves; without this drain a late callback
+        // would call back into a half-released detector.
+        processorGate.drain()
         val activeRecording = recording
         recording = null
         if (activeRecording != null) {
@@ -734,6 +759,14 @@ class AndroidCameraStream @JvmOverloads constructor(
             recording = null
             recordingFinalize = null
         }
+        // After unbindAll the analyzer callback stops firing, but a
+        // dispatch already on the gate is independent of CameraX
+        // teardown. Drain so the host's processor closure has fully
+        // returned by the time disconnect resolves, then release the
+        // executor thread. Idempotent — safe to call even when the
+        // gate is idle.
+        processorGate.drain()
+        processorGate.shutdown()
         healthBus?.publish(HealthEvent.StreamDisconnected(streamId, "normal"))
     }
 
@@ -741,8 +774,21 @@ class AndroidCameraStream @JvmOverloads constructor(
      * Frame analysis hook reused by host apps for things like hand
      * detection. Throttled internally to [throttleHz]; pass `0` to
      * disable throttling.
+     *
+     * The [body] closure receives a [FrameSnapshot] (a copy of the
+     * underlying `ImageProxy`'s pixels, owned by the SDK) and is
+     * invoked on a dedicated single-threaded executor — NOT the camera
+     * analyzer thread. This decouples detector latency from the camera
+     * capture cadence so the recorded mp4 keeps a clean 30 fps even
+     * when the host's detector runs slower than the inter-frame budget.
+     * When a previous closure is still running, the SDK drops new
+     * frames at the producer side instead of letting CameraX silently
+     * drop them downstream (see [FrameProcessorGate] for details).
+     *
+     * Host contract: do NOT recycle the snapshot's bitmap, do NOT hold
+     * references to it past the closure's return.
      */
-    fun setFrameProcessor(throttleHz: Double = 0.0, body: (ImageProxy, Int) -> Unit) {
+    fun setFrameProcessor(throttleHz: Double = 0.0, body: (FrameSnapshot) -> Unit) {
         this.throttleHz = throttleHz
         this.frameProcessor = body
     }
@@ -757,13 +803,52 @@ class AndroidCameraStream @JvmOverloads constructor(
         val tsNs = proxy.imageInfo.timestamp
 
         // Frame processor — runs whether or not we're recording so
-        // previews + hand detection keep working pre-record.
+        // previews + hand detection keep working pre-record. Dispatched
+        // through [processorGate] to a dedicated serial executor so the
+        // closure never blocks the analyzer thread; see the gate's
+        // declaration for the motivating production data.
         val processor = frameProcessor
         if (processor != null) {
             val intervalNs = if (throttleHz > 0.0) (1_000_000_000.0 / throttleHz).toLong() else 0L
             if (intervalNs == 0L || tsNs - lastProcessorCallNs >= intervalNs) {
-                processor(proxy, frameCount)
-                lastProcessorCallNs = tsNs
+                // Copy the proxy's RGBA pixels to a Bitmap synchronously
+                // on the analyzer thread (cheap memcpy for the
+                // OUTPUT_IMAGE_FORMAT_RGBA_8888 path the analyzer
+                // builder forces; well under the inter-frame budget),
+                // then hand the snapshot off to the gate. The proxy
+                // itself is closed by the analyzer-callback caller
+                // immediately after this method returns, freeing the
+                // CameraX buffer-pool slot for the next frame even when
+                // the processor is still running.
+                val bitmap = runCatching { proxy.toBitmap() }
+                    .onFailure { Log.w(TAG, "ImageProxy.toBitmap() failed", it) }
+                    .getOrNull()
+                if (bitmap != null) {
+                    val snapshot = FrameSnapshot(
+                        bitmap = bitmap,
+                        frameIndex = frameCount,
+                        timestampNs = tsNs,
+                        rotationDegrees = proxy.imageInfo.rotationDegrees,
+                    )
+                    val dispatched = processorGate.tryEnqueue {
+                        try {
+                            processor(snapshot)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "frame processor threw", t)
+                        } finally {
+                            runCatching { if (!bitmap.isRecycled) bitmap.recycle() }
+                        }
+                    }
+                    if (dispatched) {
+                        lastProcessorCallNs = tsNs
+                    } else {
+                        // Gate was busy — drop this frame and recycle
+                        // the bitmap immediately so the allocation
+                        // doesn't leak. The next analyzer callback will
+                        // try again.
+                        runCatching { if (!bitmap.isRecycled) bitmap.recycle() }
+                    }
+                }
             }
         }
 

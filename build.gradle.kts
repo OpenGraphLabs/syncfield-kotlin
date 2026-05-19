@@ -9,7 +9,7 @@ plugins {
     alias(libs.plugins.kotlin.serialization) apply false
 }
 
-val syncFieldReleaseVersion = "0.5.0"
+val syncFieldReleaseVersion = "0.6.0"
 
 fun publishedGroup(): String {
     if (System.getenv("JITPACK") == "true") {
